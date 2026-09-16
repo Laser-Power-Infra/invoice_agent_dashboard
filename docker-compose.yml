@@ -34,7 +34,10 @@ services:
     container_name: invoice_backend
     restart: always
     env_file:
-      - ./server/.env
+      - path: .env
+        required: false
+      - path: ./server/.env
+        required: false
     environment:
       PORT: 6005
       MYSQL_HOST: ${MYSQL_HOST:-192.168.1.190}
@@ -70,8 +73,11 @@ services:
     image: ngrok/ngrok:latest
     container_name: invoice_ngrok
     restart: always
-    environment:
-      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    env_file:
+      - path: .env
+        required: false
+      - path: ./server/.env
+        required: false
     command:
       - "http"
       - "backend:6005"
