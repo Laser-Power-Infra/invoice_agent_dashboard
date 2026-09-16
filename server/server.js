@@ -12,6 +12,7 @@ import mysql from 'mysql2/promise';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '.env') });
+dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const PORT = process.env.PORT || 4000;
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '1gTwzZ76i7saaiEiM_cd09LSL1IiAospQ';
