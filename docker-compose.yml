@@ -1,6 +1,6 @@
 services:
   # ---------------------------------------------------
-  # Database Service: MySQL 8.0 with Persistent Storage
+  # Database Service: MySQL 8.0 (Optional local container)
   # ---------------------------------------------------
   mysql:
     image: mysql:8.0
@@ -21,6 +21,7 @@ services:
       start_period: 10s
     networks:
       - invoice_net
+      - infra
 
   # ---------------------------------------------------
   # Backend Service: Node.js Express API (Port 6005)
@@ -42,11 +43,9 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-invoice_db}
     ports:
       - "6005:6005"
-    depends_on:
-      mysql:
-        condition: service_healthy
     networks:
       - invoice_net
+      - infra
 
   # ---------------------------------------------------
   # Frontend Service: Nginx + Compiled Vite SPA (Port 6004)
@@ -59,11 +58,9 @@ services:
     restart: always
     ports:
       - "6004:6004"
-    depends_on:
-      backend:
-        condition: service_healthy
     networks:
       - invoice_net
+      - infra
 
   # ---------------------------------------------------
   # Ngrok Tunnel Service: Public Tunnel for Port 6005
@@ -83,10 +80,14 @@ services:
       - backend
     networks:
       - invoice_net
+      - infra
 
 networks:
   invoice_net:
     driver: bridge
+  infra:
+    name: infra
+    external: true
 
 volumes:
   mysql_data:
