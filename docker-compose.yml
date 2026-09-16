@@ -3,6 +3,7 @@ services:
   # Database Service: MySQL 8.0 (Optional local container)
   # ---------------------------------------------------
   mysql:
+    profiles: ["local-db"]
     image: mysql:8.0
     container_name: invoice_mysql
     restart: always
