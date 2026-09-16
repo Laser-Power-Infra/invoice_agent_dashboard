@@ -4888,6 +4888,67 @@ function formatToISTDateString(dateInput) {
   return `${dayStr} ${monthStr} ${dayNum} ${yearStr} ${timeStr} GMT+0530 (India Standard Time)`;
 }
 
+// In-place patch of state array for a targeted single-row update (zero full-table download)
+function patchSingleRecordInState(type, searchVal, updatedRecord) {
+  if (!updatedRecord) return;
+  const cleanVal = String(searchVal).trim().toLowerCase();
+  let parsedArray = {};
+  try {
+    if (updatedRecord.array) parsedArray = JSON.parse(updatedRecord.array);
+  } catch (e) {}
+
+  if (type === 'purchase') {
+    const idx = state.purchases.findIndex(p =>
+      String(p.party_inv_no || '').trim().toLowerCase() === cleanVal ||
+      String(p.id || '').trim().toLowerCase().includes(cleanVal)
+    );
+    if (idx !== -1) {
+      state.purchases[idx] = {
+        ...state.purchases[idx],
+        ...updatedRecord,
+        _rawArray: updatedRecord.array || state.purchases[idx]._rawArray,
+        tds_percent: parsePercentValue(updatedRecord.tds_percent ?? parsedArray.tds_percent ?? state.purchases[idx].tds_percent),
+        tds_value: parseNumericValue(updatedRecord.tds_value ?? parsedArray.tds_value ?? state.purchases[idx].tds_value),
+        bill_freight_val: parseNumericValue(updatedRecord.bill_freight_val ?? parsedArray.bill_freight_val ?? state.purchases[idx].bill_freight_val),
+        taxable_value: parseNumericValue(updatedRecord.taxable_value ?? parsedArray.taxable_value ?? state.purchases[idx].taxable_value),
+        net_payable: parseNumericValue(updatedRecord.net_payable ?? parsedArray.net_payable ?? state.purchases[idx].net_payable),
+        validated: String(updatedRecord.validated || parsedArray.validated || state.purchases[idx].validated).toLowerCase() === 'true'
+      };
+      saveToLocalStorage();
+      console.log(`⚡ Targeted in-place update for purchase ${searchVal} applied cleanly.`);
+    }
+  } else {
+    const idx = state.invoices.findIndex(i =>
+      String(i.invoice_number || i.party_inv_no || i.our_bill_no || '').trim().toLowerCase() === cleanVal ||
+      String(i.id || '').trim().toLowerCase().includes(cleanVal)
+    );
+    if (idx !== -1) {
+      state.invoices[idx] = {
+        ...state.invoices[idx],
+        ...updatedRecord,
+        _rawArray: updatedRecord.array || state.invoices[idx]._rawArray,
+        validated: String(updatedRecord.validated || parsedArray.validated || state.invoices[idx].validated).toLowerCase() === 'true',
+        validation_timestamp: updatedRecord.validation_timestamp || parsedArray.validation_timestamp || state.invoices[idx].validation_timestamp
+      };
+      saveToLocalStorage();
+      console.log(`⚡ Targeted in-place update for invoice ${searchVal} applied cleanly.`);
+    }
+  }
+}
+
+// Global helper to view real-time DB metrics from developer console
+window.getDbMetrics = async () => {
+  try {
+    const res = await safeFetch(`${SERVER_BASE_URL}/api/db-metrics`);
+    const data = await res.json();
+    console.table(data.metrics.queryBreakdownLastMinute);
+    console.log('Database Query Metrics (Sliding 60s window):', data.metrics);
+    return data.metrics;
+  } catch (e) {
+    console.error('Could not fetch DB metrics:', e);
+  }
+};
+
 async function sendSheetUpdate(type, partyInvNo, fields, record = null, options = {}) {
   if (!partyInvNo) return;
   
@@ -4981,6 +5042,9 @@ async function sendSheetUpdate(type, partyInvNo, fields, record = null, options 
     });
     const result = await res.json();
     if (result.success || result.status === 'success') {
+      if (result.updatedRecord) {
+        patchSingleRecordInState(type, searchVal, result.updatedRecord);
+      }
       if (!options.silent) showToast("Spreadsheet updated successfully!", "success");
     } else {
       throw new Error(result.message || 'unknown response');

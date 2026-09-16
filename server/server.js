@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import compression from 'compression';
 import mysql from 'mysql2/promise';
+import crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '.env') });
@@ -131,6 +132,77 @@ const dbPool = mysql.createPool({
   keepAliveInitialDelay: 0
 });
 
+// ---------- Real-Time Database Query Monitor & Metrics ----------
+class DBQueryTracker {
+  constructor() {
+    this.queries = []; // Rolling 60s window: { timestamp, type, durationMs }
+    this.wastedSyncsSkipped = 0;
+    this.totalSyncsExecuted = 0;
+    this.singleRowUpdatesCount = 0;
+  }
+
+  record(type, durationMs = 0) {
+    const now = Date.now();
+    this.queries.push({ timestamp: now, type, durationMs });
+    this.cleanup(now);
+  }
+
+  recordSkippedSync() {
+    this.wastedSyncsSkipped++;
+  }
+
+  recordExecutedSync() {
+    this.totalSyncsExecuted++;
+  }
+
+  recordSingleRowUpdate() {
+    this.singleRowUpdatesCount++;
+  }
+
+  cleanup(now = Date.now()) {
+    const cutoff = now - 60000;
+    while (this.queries.length > 0 && this.queries[0].timestamp < cutoff) {
+      this.queries.shift();
+    }
+  }
+
+  getMetrics() {
+    this.cleanup();
+    const breakdown = {};
+    let totalDuration = 0;
+    this.queries.forEach(q => {
+      breakdown[q.type] = (breakdown[q.type] || 0) + 1;
+      totalDuration += q.durationMs;
+    });
+    const queriesLastMinute = this.queries.length;
+    const avgDurationMs = queriesLastMinute > 0 ? Number((totalDuration / queriesLastMinute).toFixed(2)) : 0;
+    return {
+      queriesPerMinute: queriesLastMinute,
+      queryBreakdownLastMinute: breakdown,
+      wastedSyncsPrevented: this.wastedSyncsSkipped,
+      totalSyncsExecuted: this.totalSyncsExecuted,
+      singleRowUpdatesTotal: this.singleRowUpdatesCount,
+      avgQueryDurationMs: avgDurationMs,
+      readCacheTtlSeconds: 60,
+      serverUptimeSeconds: Math.floor(process.uptime())
+    };
+  }
+}
+const dbTracker = new DBQueryTracker();
+
+// In-memory cache for table column metadata to eliminate repeated SHOW COLUMNS queries
+const schemaColumnsCache = {};
+async function getTableColumns(conn, tableName) {
+  if (schemaColumnsCache[tableName]) {
+    return schemaColumnsCache[tableName];
+  }
+  const start = Date.now();
+  const [cols] = await conn.query(`SHOW COLUMNS FROM \`${tableName}\``);
+  dbTracker.record('SCHEMA_METADATA', Date.now() - start);
+  schemaColumnsCache[tableName] = cols;
+  return cols;
+}
+
 async function getDBConnection() {
   try {
     return await dbPool.getConnection();
@@ -175,34 +247,19 @@ function sanitizeRows(rows) {
   });
 }
 
-// Dynamically create tables and insert rows in bulk
-async function syncSheetsToMySQL(fullData) {
-  let conn;
-  try {
-    conn = await getDBConnection();
-    
-    // 1. Process Invoices -> Table: "Item Details"
-    const invoices = sanitizeRows(fullData.invoices || []);
-    if (invoices.length > 0) {
-      const columns = getAllKeys(invoices);
-      await ensureTableExists(conn, 'Item Details', columns);
-      await insertRowsBulk(conn, 'Item Details', invoices, columns);
-    }
+let isSyncingToMySQL = false;
 
-    // 2. Process Purchases -> Table: "Invoice Details"
-    const purchases = sanitizeRows(fullData.purchases || []);
-    if (purchases.length > 0) {
-      const columns = getAllKeys(purchases);
-      await ensureTableExists(conn, 'Invoice Details', columns);
-      await insertRowsBulk(conn, 'Invoice Details', purchases, columns);
-    }
-    
-    console.log('Successfully synchronized all Google Sheets data into MySQL.');
-  } catch (err) {
-    console.error('Error syncing to MySQL:', err.message);
-  } finally {
-    if (conn) conn.release();
+// Build a unique deduplication key for each row to detect new insertions
+function getRowUniqueKey(row, tableName) {
+  if (tableName === 'Invoice Details') {
+    // For Purchases / Bills: party_inv_no is unique
+    return String(row.party_inv_no || row.invoice_number || '').trim().toLowerCase();
   }
+  // For Invoices (Item Details): composite key includes party_inv_no and LR / vehicle to support split shipments
+  const inv = String(row.party_inv_no || row.invoice_number || row.our_bill_no || '').trim().toLowerCase();
+  const lr = String(row.cn_lr_no || row.lr_no || '').trim().toLowerCase();
+  const lorry = String(row.lorry_vehicle_no || row.truck_no || '').trim().toLowerCase();
+  return `${inv}::${lr}::${lorry}`;
 }
 
 async function ensureTableExists(conn, tableName, columns) {
@@ -224,31 +281,57 @@ async function ensureTableExists(conn, tableName, columns) {
   } catch (e) {}
 }
 
-async function insertRowsBulk(conn, tableName, rows, columns) {
-  if (rows.length === 0) return;
+async function insertNewRowsOnly(conn, tableName, rows, columns) {
+  if (rows.length === 0) return 0;
 
-  const tempTableName = `${tableName}_temp`;
-  const oldTableName = `${tableName}_old`;
+  // 1. Ensure live table exists with columns
+  await ensureTableExists(conn, tableName, columns);
 
-  // 1. Clean up leftover temp and old tables if present
-  await conn.query(`DROP TABLE IF EXISTS \`${tempTableName}\``);
-  await conn.query(`DROP TABLE IF EXISTS \`${oldTableName}\``);
+  // 2. Check if table already has rows
+  const [countResult] = await conn.query(`SELECT COUNT(*) AS count FROM \`${tableName}\``);
+  const totalInDb = countResult[0]?.count || 0;
 
-  // 2. Ensure temp table exists with identical column schema
-  await ensureTableExists(conn, tempTableName, columns);
+  let newRowsToInsert = rows;
 
-  // 3. Clear temp table
-  await conn.query(`TRUNCATE TABLE \`${tempTableName}\``);
+  if (totalInDb > 0) {
+    // Read existing keys from MySQL (fast indexed / minimal column read)
+    const [existingTableCols] = await conn.query(`SHOW COLUMNS FROM \`${tableName}\``);
+    const existingColNames = existingTableCols.map(c => c.Field.toLowerCase());
+    
+    const candidateCols = ['party_inv_no', 'our_bill_no', 'cn_lr_no', 'lorry_vehicle_no', 'invoice_number'];
+    const validSelectCols = candidateCols
+      .filter(c => existingColNames.includes(c.toLowerCase()))
+      .map(c => `\`${c}\``)
+      .join(', ');
 
-  // 4. Insert all rows in bulk into the temp table (never lock or empty the live table during insert)
+    if (validSelectCols) {
+      const [existingKeysRows] = await conn.query(`SELECT ${validSelectCols} FROM \`${tableName}\``);
+      const existingKeySet = new Set(existingKeysRows.map(r => getRowUniqueKey(r, tableName)));
+
+      // Filter strictly for rows that do NOT exist in MySQL
+      newRowsToInsert = rows.filter(r => {
+        const k = getRowUniqueKey(r, tableName);
+        return k && !existingKeySet.has(k);
+      });
+    }
+  }
+
+  if (newRowsToInsert.length === 0) {
+    console.log(`✅ [${tableName}] All ${totalInDb} rows are already up-to-date in MySQL. 0 new rows to insert.`);
+    return 0;
+  }
+
+  console.log(`✨ [${tableName}] Found ${newRowsToInsert.length} brand-new row(s) to insert into MySQL (Current: ${totalInDb}).`);
+
+  // 3. Insert ONLY the new rows directly into the live table (NEVER DROP live table!)
   const colNames = columns.map(c => `\`${c}\``).join(', ');
   const chunkSize = 100;
-  for (let i = 0; i < rows.length; i += chunkSize) {
-    const chunk = rows.slice(i, i + chunkSize);
-    let sql = `INSERT INTO \`${tempTableName}\` (${colNames}) VALUES `;
+  for (let i = 0; i < newRowsToInsert.length; i += chunkSize) {
+    const chunk = newRowsToInsert.slice(i, i + chunkSize);
+    let sql = `INSERT INTO \`${tableName}\` (${colNames}) VALUES `;
     const values = [];
     const placeholders = [];
-    
+
     chunk.forEach(row => {
       const rowPlaceholders = columns.map(col => {
         let val = row[col];
@@ -264,33 +347,69 @@ async function insertRowsBulk(conn, tableName, rows, columns) {
       });
       placeholders.push(`(${rowPlaceholders.join(', ')})`);
     });
-    
+
     sql += placeholders.join(', ');
+    const qStart = Date.now();
     await conn.query(sql, values);
+    dbTracker.record('SYNC_NEW_ROWS_INSERT', Date.now() - qStart);
   }
 
-  // 5. ATOMIC SWAP: Instantly swap temp table to live table (0ms downtime, zero empty state window)
-  const [tables] = await conn.query('SHOW TABLES');
-  const tableNames = tables.map(t => Object.values(t)[0].toLowerCase());
+  return newRowsToInsert.length;
+}
 
-  if (tableNames.includes(tableName.toLowerCase())) {
-    await conn.query(`RENAME TABLE \`${tableName}\` TO \`${oldTableName}\`, \`${tempTableName}\` TO \`${tableName}\``);
-    await conn.query(`DROP TABLE IF EXISTS \`${oldTableName}\``);
-  } else {
-    await conn.query(`RENAME TABLE \`${tempTableName}\` TO \`${tableName}\``);
+// Dynamically create tables and insert ONLY new rows incrementally
+async function syncSheetsToMySQL(fullData) {
+  if (isSyncingToMySQL) {
+    console.log('Sync to MySQL already in progress, skipping concurrent duplicate run.');
+    return;
+  }
+  isSyncingToMySQL = true;
+  let conn;
+  try {
+    conn = await getDBConnection();
+    
+    // 1. Process Invoices -> Table: "Item Details"
+    const invoices = sanitizeRows(fullData.invoices || []);
+    let newInvoicesCount = 0;
+    if (invoices.length > 0) {
+      const columns = getAllKeys(invoices);
+      newInvoicesCount = await insertNewRowsOnly(conn, 'Item Details', invoices, columns);
+    }
+
+    // 2. Process Purchases -> Table: "Invoice Details"
+    const purchases = sanitizeRows(fullData.purchases || []);
+    let newPurchasesCount = 0;
+    if (purchases.length > 0) {
+      const columns = getAllKeys(purchases);
+      newPurchasesCount = await insertNewRowsOnly(conn, 'Invoice Details', purchases, columns);
+    }
+    
+    if (newInvoicesCount > 0 || newPurchasesCount > 0) {
+      localDbMemoryCache = null; // Invalidate memory cache only when new records were added
+      console.log(`🎉 Successfully added ${newInvoicesCount} new invoices and ${newPurchasesCount} new purchases into MySQL.`);
+    } else {
+      console.log('✅ MySQL database is fully synchronized. Zero writes performed.');
+    }
+  } catch (err) {
+    console.error('Error syncing to MySQL:', err.message);
+  } finally {
+    isSyncingToMySQL = false;
+    if (conn) conn.release();
   }
 }
 
 let localDbMemoryCache = null;
 let localDbMemoryCacheTime = 0;
+const CACHE_TTL_MYSQL = 60000; // 60 seconds TTL (single-row updates patch in-place)
 
 async function loadDataFromMySQL() {
   const now = Date.now();
-  if (localDbMemoryCache && (now - localDbMemoryCacheTime < 5000)) {
+  if (localDbMemoryCache && (now - localDbMemoryCacheTime < CACHE_TTL_MYSQL)) {
     return localDbMemoryCache;
   }
 
   let conn;
+  const start = Date.now();
   try {
     conn = await getDBConnection();
     const [tables] = await conn.query('SHOW TABLES');
@@ -308,6 +427,8 @@ async function loadDataFromMySQL() {
       purchases = cleanMySQLRows(rows);
     }
     
+    dbTracker.record('SELECT_ALL_TABLES', Date.now() - start);
+
     localDbMemoryCache = {
       success: true,
       invoices,
@@ -334,21 +455,13 @@ function cleanMySQLRows(rows) {
 
 async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates) {
   let conn;
+  const start = Date.now();
   try {
-    localDbMemoryCache = null; // Invalidate memory cache on record update
     conn = await getDBConnection();
     const tableName = sheetName === 'Purchase_data' ? 'Invoice Details' : 'Item Details';
     
-    // Check if the table exists
-    const [tables] = await conn.query('SHOW TABLES');
-    const tableNames = tables.map(t => Object.values(t)[0].toLowerCase());
-    if (!tableNames.includes(tableName.toLowerCase())) {
-      console.warn(`Table "${tableName}" does not exist in MySQL. Skipping local update.`);
-      return;
-    }
-    
-    // Fetch actual columns in the target table to avoid ER_BAD_FIELD_ERROR
-    const [cols] = await conn.query(`SHOW COLUMNS FROM \`${tableName}\``);
+    // Fetch columns using in-memory schema cache to save queries
+    const cols = await getTableColumns(conn, tableName);
     const validUpdates = {};
     Object.entries(updates).forEach(([k, v]) => {
       const matchedCol = cols.find(c => c.Field.toLowerCase() === k.toLowerCase());
@@ -356,12 +469,6 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
         validUpdates[matchedCol.Field] = v;
       }
     });
-
-    const keys = Object.keys(validUpdates);
-    if (keys.length === 0 && !cols.some(c => c.Field.toLowerCase() === 'array')) {
-      console.warn(`No valid columns matched in table "${tableName}" for update payload:`, Object.keys(updates));
-      return;
-    }
 
     const searchColField = cols.find(c => c.Field.toLowerCase() === searchColumn.toLowerCase())?.Field || searchColumn;
     const cleanSearchVal = String(searchValue).trim();
@@ -374,6 +481,7 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
           `SELECT \`array\` FROM \`${tableName}\` WHERE TRIM(LOWER(\`${searchColField}\`)) = TRIM(LOWER(?)) LIMIT 1`,
           [cleanSearchVal]
         );
+        dbTracker.record('SELECT_SINGLE_ROW', 1);
         if (existingRows && existingRows.length > 0 && existingRows[0].array) {
           const arrObj = JSON.parse(existingRows[0].array);
           Object.assign(arrObj, updates);
@@ -389,7 +497,7 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
     const setKeys = Object.keys(validUpdates);
     if (setKeys.length === 0) {
       console.warn(`No valid columns to update in table "${tableName}".`);
-      return;
+      return null;
     }
 
     const setClauses = setKeys.map(k => `\`${k}\` = ?`).join(', ');
@@ -406,6 +514,7 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
     // Primary query: TRIM search match
     const sql = `UPDATE \`${tableName}\` SET ${setClauses} WHERE TRIM(\`${searchColField}\`) = ?`;
     let [result] = await conn.query(sql, [...values, cleanSearchVal]);
+    let matchedColUsed = searchColField;
 
     // Fallback search columns if primary match yielded 0 affected rows
     if (result.affectedRows === 0) {
@@ -417,6 +526,8 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
         const fbSql = `UPDATE \`${tableName}\` SET ${setClauses} WHERE TRIM(LOWER(\`${actualColName}\`)) = TRIM(LOWER(?))`;
         const [fbResult] = await conn.query(fbSql, [...values, cleanSearchVal]);
         if (fbResult.affectedRows > 0) {
+          matchedColUsed = actualColName;
+          result = fbResult;
           console.log(`MySQL Fallback Update succeeded on column "${actualColName}":`, fbResult.affectedRows, 'rows affected');
           break;
         }
@@ -424,8 +535,42 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
     } else {
       console.log('MySQL Update result:', result.affectedRows, 'rows affected');
     }
+
+    dbTracker.record('UPDATE_SINGLE_ROW', Date.now() - start);
+    dbTracker.recordSingleRowUpdate();
+
+    // Fetch strictly the single updated row from MySQL (1-row fast query)
+    let updatedSingleRow = null;
+    if (result.affectedRows > 0) {
+      const [rows] = await conn.query(
+        `SELECT * FROM \`${tableName}\` WHERE TRIM(LOWER(\`${matchedColUsed}\`)) = TRIM(LOWER(?)) LIMIT 1`,
+        [cleanSearchVal]
+      );
+      dbTracker.record('SELECT_SINGLE_ROW', 1);
+      if (rows && rows.length > 0) {
+        updatedSingleRow = cleanMySQLRows(rows)[0];
+      }
+    }
+
+    // In-place patch of server memory cache WITHOUT clearing or reloading the whole database!
+    if (localDbMemoryCache && updatedSingleRow) {
+      const listKey = sheetName === 'Purchase_data' ? 'purchases' : 'invoices';
+      const idKey = sheetName === 'Purchase_data' ? 'party_inv_no' : 'invoice_number';
+      const list = localDbMemoryCache[listKey] || [];
+      const idx = list.findIndex(item =>
+        String(item[idKey] || item.party_inv_no || item.our_bill_no || '').trim().toLowerCase() === cleanSearchVal.toLowerCase()
+      );
+      if (idx !== -1) {
+        list[idx] = { ...list[idx], ...updatedSingleRow };
+      } else {
+        list.push(updatedSingleRow);
+      }
+    }
+
+    return updatedSingleRow;
   } catch (err) {
     console.error('MySQL Update record failed:', err.message);
+    return null;
   } finally {
     if (conn) conn.release();
   }
@@ -508,21 +653,23 @@ app.get('/api/data', async (req, res) => {
 app.post('/api/update-record', async (req, res) => {
   const { sheetName, searchColumn, searchValue, updates } = req.body || {};
   let scriptResult = { success: true, status: 'success', message: 'Updated locally in MySQL database' };
+  let updatedRow = null;
 
   try {
-    // 1. Always update MySQL database first
+    // 1. Always update MySQL database first and get the updated single record
     if (sheetName && searchColumn && searchValue && updates) {
       dataCache = null;
-      await updateRecordInMySQL(sheetName, searchColumn, searchValue, updates);
+      updatedRow = await updateRecordInMySQL(sheetName, searchColumn, searchValue, updates);
     }
 
     // 2. Proxy update to Google Sheets in background with graceful fallback
     const UPDATE_SCRIPT_URL = process.env.APPS_SCRIPT_URL || APPS_SCRIPT_URL;
-    console.log('\nSending update request to Google Sheets:', JSON.stringify(req.body, null, 2));
+    const updateKeys = updates ? Object.keys(updates).join(', ') : 'none';
+    console.log(`📤 Syncing update to Google Sheets [${sheetName}] for ${searchColumn}: "${searchValue}" (Fields: ${updateKeys})`);
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 20000);
+      const timeout = setTimeout(() => controller.abort(), 45000); // 45s timeout for Google Apps Script
 
       const response = await fetch(UPDATE_SCRIPT_URL, {
         method: 'POST',
@@ -543,11 +690,57 @@ app.post('/api/update-record', async (req, res) => {
       console.warn('Google Sheets sync warning (MySQL updated cleanly):', scriptErr.message);
     }
 
-    res.json(scriptResult);
+    res.json({
+      ...scriptResult,
+      updatedRecord: updatedRow
+    });
   } catch (err) {
     console.error('Update record handler error:', err.message);
-    res.json({ success: true, status: 'success', warning: err.message });
+    res.json({ success: true, status: 'success', warning: err.message, updatedRecord: updatedRow });
   }
+});
+
+// GET /api/record — fetch strictly a single invoice or purchase by number (ultra-light 1ms query)
+app.get('/api/record', async (req, res) => {
+  const type = (req.query.type || 'invoice').toLowerCase();
+  const number = String(req.query.number || req.query.invoiceNumber || '').trim();
+  if (!number) {
+    return res.status(400).json({ success: false, error: 'Query parameter "number" is required.' });
+  }
+
+  let conn;
+  const start = Date.now();
+  try {
+    conn = await getDBConnection();
+    const tableName = type === 'purchase' ? 'Invoice Details' : 'Item Details';
+    const cols = await getTableColumns(conn, tableName);
+    const searchCol = type === 'purchase' ? 'party_inv_no' : 'our_bill_no';
+    const searchField = cols.find(c => c.Field.toLowerCase() === searchCol.toLowerCase())?.Field || cols[1]?.Field || 'id';
+
+    const [rows] = await conn.query(
+      `SELECT * FROM \`${tableName}\` WHERE TRIM(LOWER(\`${searchField}\`)) = TRIM(LOWER(?)) LIMIT 1`,
+      [number]
+    );
+    dbTracker.record('SELECT_SINGLE_ROW', Date.now() - start);
+
+    if (rows && rows.length > 0) {
+      const single = cleanMySQLRows(rows)[0];
+      return res.json({ success: true, record: single });
+    }
+    return res.status(404).json({ success: false, message: 'Record not found.' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// GET /api/db-metrics — track database queries per minute, query breakdown, and CPU savings
+app.get('/api/db-metrics', (req, res) => {
+  res.json({
+    success: true,
+    metrics: dbTracker.getMetrics()
+  });
 });
 
 // POST /upload — upload PDF to Google Drive
@@ -876,32 +1069,48 @@ app.get('/api/agent-notification', (req, res) => {
 });
 
 
-// Warm cache background runner
-async function warmCacheBackground() {
+// Warm cache background runner with checksum diffing (eliminates redundant MySQL table drops & writes)
+let lastDataChecksum = null;
+
+async function warmCacheBackground(force = false) {
   if (activeFetchPromise) {
-    console.log('Cache warming already in progress, skipping background trigger.');
+    console.log('Cache check already in progress, skipping background trigger.');
     return;
   }
-  console.log('Background cache warming started...');
+  console.log('Background cache check started...');
   try {
     activeFetchPromise = fetchFreshData();
     const rawText = await activeFetchPromise;
     activeFetchPromise = null;
+
+    const currentChecksum = crypto.createHash('md5').update(rawText).digest('hex');
+    if (!force && lastDataChecksum && currentChecksum === lastDataChecksum) {
+      dbTracker.recordSkippedSync();
+      console.log(`⚡ Google Sheets data unchanged (checksum: ${currentChecksum.slice(0, 8)}). Skipped redundant MySQL sync.`);
+      return;
+    }
+
+    lastDataChecksum = currentChecksum;
+    dbTracker.recordExecutedSync();
     
+    // Invalidate schema cache so new columns are detected
+    Object.keys(schemaColumnsCache).forEach(k => delete schemaColumnsCache[k]);
+
     const fullData = JSON.parse(rawText);
     await syncSheetsToMySQL(fullData);
-    console.log('Successfully warmed MySQL database in background.');
+    localDbMemoryCache = null; // Invalidate memory cache on fresh sync
+    console.log('Successfully synchronized fresh Google Sheets data into MySQL.');
   } catch (err) {
     activeFetchPromise = null;
-    console.warn('Background cache warming failed:', err.message);
+    console.warn('Background cache check failed:', err.message);
   }
 }
 
 // Start cache warming immediately on start-up
-warmCacheBackground();
+warmCacheBackground(true);
 
-// Periodically re-warm cache every 20 seconds (20000 ms) to keep it fresh
-setInterval(warmCacheBackground, 20000);
+// Lazy background fallback check every 15 minutes (with checksum verification to prevent wasted DB writes)
+setInterval(() => warmCacheBackground(false), 15 * 60 * 1000);
 
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
   app.listen(PORT, () => {
