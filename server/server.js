@@ -358,13 +358,42 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
     });
 
     const keys = Object.keys(validUpdates);
-    if (keys.length === 0) {
+    if (keys.length === 0 && !cols.some(c => c.Field.toLowerCase() === 'array')) {
       console.warn(`No valid columns matched in table "${tableName}" for update payload:`, Object.keys(updates));
       return;
     }
-    
-    const setClauses = keys.map(k => `\`${k}\` = ?`).join(', ');
-    const values = keys.map(k => {
+
+    const searchColField = cols.find(c => c.Field.toLowerCase() === searchColumn.toLowerCase())?.Field || searchColumn;
+    const cleanSearchVal = String(searchValue).trim();
+
+    // Sync array JSON field in MySQL if present
+    const hasArrayCol = cols.some(c => c.Field.toLowerCase() === 'array');
+    if (hasArrayCol) {
+      try {
+        const [existingRows] = await conn.query(
+          `SELECT \`array\` FROM \`${tableName}\` WHERE TRIM(LOWER(\`${searchColField}\`)) = TRIM(LOWER(?)) LIMIT 1`,
+          [cleanSearchVal]
+        );
+        if (existingRows && existingRows.length > 0 && existingRows[0].array) {
+          const arrObj = JSON.parse(existingRows[0].array);
+          Object.assign(arrObj, updates);
+          validUpdates['array'] = JSON.stringify(arrObj);
+        } else if (validUpdates['array']) {
+          // If array string was passed in payload, use it directly
+        }
+      } catch (e) {
+        console.warn('Could not update array JSON column in MySQL:', e.message);
+      }
+    }
+
+    const setKeys = Object.keys(validUpdates);
+    if (setKeys.length === 0) {
+      console.warn(`No valid columns to update in table "${tableName}".`);
+      return;
+    }
+
+    const setClauses = setKeys.map(k => `\`${k}\` = ?`).join(', ');
+    const values = setKeys.map(k => {
       let val = validUpdates[k];
       if (val === null || val === undefined) {
         return '';
@@ -373,15 +402,28 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
       }
       return String(val);
     });
-    
-    // Add searchValue
-    values.push(String(searchValue));
-    
-    const matchedSearchCol = cols.find(c => c.Field.toLowerCase() === searchColumn.toLowerCase())?.Field || searchColumn;
-    const sql = `UPDATE \`${tableName}\` SET ${setClauses} WHERE \`${matchedSearchCol}\` = ?`;
-    console.log(`Executing MySQL Update: ${sql} with values:`, values);
-    const [result] = await conn.query(sql, values);
-    console.log('MySQL Update result:', result.affectedRows, 'rows affected');
+
+    // Primary query: TRIM search match
+    const sql = `UPDATE \`${tableName}\` SET ${setClauses} WHERE TRIM(\`${searchColField}\`) = ?`;
+    let [result] = await conn.query(sql, [...values, cleanSearchVal]);
+
+    // Fallback search columns if primary match yielded 0 affected rows
+    if (result.affectedRows === 0) {
+      const fallbackCols = ['party_inv_no', 'our_bill_no', 'present_our_invoice', 'invoice_number'].filter(
+        c => cols.some(col => col.Field.toLowerCase() === c)
+      );
+      for (const fCol of fallbackCols) {
+        const actualColName = cols.find(col => col.Field.toLowerCase() === fCol).Field;
+        const fbSql = `UPDATE \`${tableName}\` SET ${setClauses} WHERE TRIM(LOWER(\`${actualColName}\`)) = TRIM(LOWER(?))`;
+        const [fbResult] = await conn.query(fbSql, [...values, cleanSearchVal]);
+        if (fbResult.affectedRows > 0) {
+          console.log(`MySQL Fallback Update succeeded on column "${actualColName}":`, fbResult.affectedRows, 'rows affected');
+          break;
+        }
+      }
+    } else {
+      console.log('MySQL Update result:', result.affectedRows, 'rows affected');
+    }
   } catch (err) {
     console.error('MySQL Update record failed:', err.message);
   } finally {

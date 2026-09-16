@@ -677,7 +677,7 @@ function parsePercentValue(value, fallback = 0) {
     const nonZero = value.map(v => parsePercentValue(v, 0)).filter(v => v > 0);
     return nonZero.length > 0 ? nonZero[0] : fallback;
   }
-  if (typeof value === 'number') return Number.isFinite(value) ? (value > 1 ? value / 100 : value) : fallback;
+  if (typeof value === 'number') return Number.isFinite(value) ? (value >= 1 ? value / 100 : value) : fallback;
 
   const cleaned = String(value).trim().replace(/,/g, '');
   if (!cleaned) return fallback;
@@ -685,11 +685,11 @@ function parsePercentValue(value, fallback = 0) {
   const percentMatch = cleaned.match(/^(-?\d+(?:\.\d+)?)\s*%$/i);
   if (percentMatch) {
     const parsed = Number(percentMatch[1]);
-    return Number.isFinite(parsed) ? parsed / 100 : fallback;
+    return Number.isFinite(parsed) ? (parsed >= 1 ? parsed / 100 : parsed) : fallback;
   }
 
   const parsed = Number(cleaned);
-  return Number.isFinite(parsed) ? (parsed > 1 ? parsed / 100 : parsed) : fallback;
+  return Number.isFinite(parsed) ? (parsed >= 1 ? parsed / 100 : parsed) : fallback;
 }
 
 // Convert API arrays/stringified columns to flat structured database objects
@@ -846,7 +846,7 @@ function processRawData(data) {
       }
     } catch (e) {}
 
-    const tdsPercent = parsePercentValue(pur.tds_percent ?? 0);
+    const tdsPercent = parsePercentValue(pur.tds_percent ?? parsedArray.tds_percent ?? 0);
     const billFreightVal = parseNumericValue(pur.bill_freight_val ?? 0);
     const taxableValue = parseNumericValue(pur.taxable_value ?? 0);
     const netPayable = parseNumericValue(pur.net_payable ?? taxableValue ?? 0);
@@ -4713,7 +4713,7 @@ function saveDetailFormOverrides() {
     const overrideStCharges = parseFloat(getFormVal('purchase-details-edit-form', 'pur_st_charges') || 0);
     const overrideTaxable = parseFloat(getFormVal('purchase-details-edit-form', 'pur_taxable_value') || 0);
     const overrideNet = parseFloat(getFormVal('purchase-details-edit-form', 'pur_net_payable') || 0);
-    const overrideTds = parseFloat(getFormVal('purchase-details-edit-form', 'pur_tds_percent') || 0);
+    const overrideTds = parsePercentValue(getFormVal('purchase-details-edit-form', 'pur_tds_percent') || 0);
     const overrideRcm = parseFloat(getFormVal('purchase-details-edit-form', 'pur_rcm') || 0);
     const overrideTotalInv = parseFloat(getFormVal('purchase-details-edit-form', 'pur_total_invoice_value') || 0);
     const overrideAiSummary = getFormVal('purchase-details-edit-form', 'pur_ai_summary');
@@ -4835,7 +4835,7 @@ function saveDetailFormOverrides() {
       st_charges: parseFloat(getFormVal('purchase-details-edit-form', 'pur_st_charges') || 0),
       taxable_value: parseFloat(getFormVal('purchase-details-edit-form', 'pur_taxable_value') || 0),
       net_payable: parseFloat(getFormVal('purchase-details-edit-form', 'pur_net_payable') || 0),
-      tds_percent: parseFloat(getFormVal('purchase-details-edit-form', 'pur_tds_percent') || 0),
+      tds_percent: parsePercentValue(getFormVal('purchase-details-edit-form', 'pur_tds_percent') || 0),
       rcm: parseFloat(getFormVal('purchase-details-edit-form', 'pur_rcm') || 0),
       total_invoice_value: parseFloat(getFormVal('purchase-details-edit-form', 'pur_total_invoice_value') || 0),
       ai_summary: getFormVal('purchase-details-edit-form', 'pur_ai_summary'),
