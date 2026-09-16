@@ -1,0 +1,10 @@
+# Client dependencies & build outputs
+node_modules
+dist
+.env
+.env.local
+
+# Track Docker & Nginx config files
+!Dockerfile
+!nginx.conf
+!.dockerignore

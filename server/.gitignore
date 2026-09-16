@@ -1,0 +1,10 @@
+# Server dependencies & credentials
+node_modules
+.env
+.env.local
+credentials.json
+token.json
+
+# Track Docker config files
+!Dockerfile
+!.dockerignore

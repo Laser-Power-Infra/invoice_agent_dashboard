@@ -1,0 +1,1825 @@
+/*********************************************************************
+ * PURCHASE DATA (ERP / DB)
+ *********************************************************************/
+
+const purchaseRows = $("Execute a SQL query").all().map(i => i.json);
+
+/*********************************************************************
+ * INVOICE JSON
+ *********************************************************************/
+
+const invoice = $("Code in JavaScript8").first().json;
+
+/*********************************************************************
+ * HELPERS
+ *********************************************************************/
+
+// Normalize vehicle numbers: strip spaces/hyphens, uppercase
+function normVehicle(v) {
+    return (v || "").toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// Normalize LR numbers: extract leading numeric part, strip leading zeros
+function normLR(v) {
+    if (v === null || v === undefined) return "";
+    const match = v.toString().match(/\d+/);
+    if (!match) return "";
+    return String(parseInt(match[0], 10));
+}
+
+// Normalize numeric strings like "89950.00" -> 89950
+function normNum(v) {
+    if (v === null || v === undefined) return NaN;
+    return Number(v.toString().replace(/,/g, ""));
+}
+
+/*********************************************************************
+ * RESULT OBJECT
+ *********************************************************************/
+
+const result = {
+    invoice_number: invoice.invoice_number,
+    fo_number: invoice.fo_no,
+    status: "PASS",
+
+    summary: {
+        purchase_rows: purchaseRows.length,
+        invoice_trucks: invoice.line_items.length
+    },
+
+    passed: [],
+    failed: [],
+    warnings: []
+};
+
+/*********************************************************************
+ * BASIC CHECKS (Header Level)
+ *********************************************************************/
+
+// FO Number  (invoice.fo_no -> db.freight_order)
+
+const dbFO = purchaseRows.length ? purchaseRows[0].freight_order : "";
+const invoiceFO = invoice.fo_no;
+
+if (dbFO === invoiceFO) {
+    result.passed.push("FO Number Matched");
+} else {
+    result.failed.push({
+        check: "FO Number",
+        invoice_data: invoiceFO,
+        erp_data: dbFO
+    });
+}
+
+// FO Rate  (invoice.fo_rate -> db.rate)  -- only if present at header level
+
+if (invoice.fo_rate !== undefined) {
+
+    const dbRate = purchaseRows.length ? normNum(purchaseRows[0].rate) : NaN;
+    const invoiceRate = normNum(invoice.fo_rate);
+
+    if (dbRate === invoiceRate) {
+        result.passed.push("FO Rate Matched");
+    } else {
+        result.failed.push({
+            check: "FO Rate",
+            invoice_data: invoiceRate,
+            erp_data: dbRate
+        });
+    }
+}
+
+// FO Qty  (invoice.fo_qty -> db.qty)
+
+if (invoice.fo_qty !== undefined) {
+
+    const dbQty = purchaseRows.length ? Number(purchaseRows[0].qty) : 0;
+    const invoiceQty = Number(invoice.fo_qty);
+
+    if (dbQty === invoiceQty) {
+        result.passed.push("FO Qty Matched");
+    } else {
+        result.failed.push({
+            check: "FO Qty",
+            invoice_data: invoiceQty,
+            erp_data: dbQty
+        });
+    }
+}
+
+// FO Order Value  (invoice.fo_order_value -> db.total_value)
+
+if (invoice.fo_order_value !== undefined) {
+
+    const dbTotal = purchaseRows.length ? normNum(purchaseRows[0].total_value) : 0;
+    const invoiceTotal = normNum(invoice.fo_order_value);
+
+    if (dbTotal === invoiceTotal) {
+        result.passed.push("FO Order Value Matched");
+    } else {
+        result.failed.push({
+            check: "FO Order Value",
+            invoice_data: invoiceTotal,
+            erp_data: dbTotal
+        });
+    }
+}
+
+/*********************************************************************
+ * INDEX PURCHASE ROWS BY sale_bill_number (matching key)
+ *********************************************************************/
+
+const purchaseMap = {};
+const duplicateBill = [];
+const seen = {};
+
+for (const row of purchaseRows) {
+
+    const key = row.sale_bill_number;
+
+    if (!seen[key]) seen[key] = 0;
+    seen[key]++;
+
+    purchaseMap[key] = {
+        sale_bill_number: row.sale_bill_number,
+        vehicle_no: row.vehicle_no,
+        lr_no: row.lr_no,
+        freight_order: row.freight_order,
+        rate: normNum(row.rate),
+        qty: Number(row.qty)
+    };
+}
+
+Object.entries(seen).forEach(([k, v]) => {
+    if (v > 1) {
+        duplicateBill.push({ sale_bill_number: k, rows: v });
+    }
+});
+
+if (duplicateBill.length) {
+    result.warnings.push({
+        check: "Duplicate Sale Bill Numbers In ERP",
+        data: duplicateBill
+    });
+}
+
+/*********************************************************************
+ * VALIDATE EVERY TRUCK (matched by our_invoice_number -> sale_bill_number)
+ *********************************************************************/
+
+const matchedBillNumbers = [];
+
+for (const truck of invoice.line_items) {
+
+    const billNo = truck.our_invoice_number;
+
+    matchedBillNumbers.push(billNo);
+
+    const purchase = purchaseMap[billNo];
+
+    if (!purchase) {
+
+        result.failed.push({
+            check: "Sale Bill Number Missing",
+            invoice_data: billNo,
+            note: "our_invoice_number present in invoice but no matching sale_bill_number found in ERP"
+        });
+
+        continue;
+    }
+
+    //--------------------------------
+    // VEHICLE NUMBER  (invoice.truck_no -> db.vehicle_no)
+
+    if (normVehicle(purchase.vehicle_no) !== normVehicle(truck.truck_no)) {
+
+        result.failed.push({
+            check: "Vehicle",
+            sale_bill_number: billNo,
+            invoice_data: truck.truck_no,
+            erp_data: purchase.vehicle_no
+        });
+
+    }
+
+    //--------------------------------
+    // LR / CN NUMBER  (invoice.lr_no -> db.lr_no)
+
+    if (normLR(purchase.lr_no) !== normLR(truck.lr_no)) {
+
+        result.failed.push({
+            check: "LR/CN Number",
+            sale_bill_number: billNo,
+            invoice_data: truck.lr_no,
+            erp_data: purchase.lr_no
+        });
+
+    }
+
+    //--------------------------------
+    // FO NUMBER (per truck)  (invoice.fo_no -> db.freight_order)
+
+    if (purchase.freight_order !== truck.fo_no) {
+
+        result.failed.push({
+            check: "FO Number",
+            sale_bill_number: billNo,
+            invoice_data: truck.fo_no,
+            erp_data: purchase.freight_order
+        });
+
+    }
+
+    //--------------------------------
+    // FREIGHT / RATE  (invoice.freight -> db.rate)
+
+    if (purchase.rate !== normNum(truck.freight)) {
+
+        result.failed.push({
+            check: "Freight Rate",
+            sale_bill_number: billNo,
+            invoice_data: normNum(truck.freight),
+            erp_data: purchase.rate
+        });
+
+    }
+
+    //--------------------------------
+
+    result.passed.push(billNo + " Validated");
+
+}
+
+/*********************************************************************
+ * MISSING PURCHASE VOUCHERS (in ERP but not in invoice)
+ *********************************************************************/
+
+Object.keys(purchaseMap).forEach(billNo => {
+
+    if (!matchedBillNumbers.includes(billNo)) {
+
+        result.failed.push({
+            check: "ERP Sale Bill Missing In Invoice",
+            sale_bill_number: billNo,
+            note: "sale_bill_number present in ERP purchase data but not found in invoice"
+        });
+
+    }
+
+});
+
+/*********************************************************************
+ * TRUCK COUNT
+ *********************************************************************/
+
+const expectedTruck = purchaseRows.length ? purchaseRows.length : 0;
+const invoiceTruck = invoice.line_items.length;
+
+if (expectedTruck !== invoiceTruck) {
+
+    result.failed.push({
+        check: "Truck Count",
+        invoice_data: invoiceTruck,
+        erp_data: expectedTruck
+    });
+
+} else {
+    result.passed.push("Truck Count Matched");
+}
+
+/*********************************************************************
+ * FINAL STATUS
+ *********************************************************************/
+
+if (result.failed.length) {
+    result.status = "FAILED";
+}
+
+/*********************************************************************
+ * RETURN
+ *********************************************************************/
+
+return [
+    {
+        json: result
+    }
+];
+
+
+/*********************************************************************
+ * PURCHASE DATA
+ *********************************************************************/
+const purchaseRows = $("Execute a SQL query").all().map(i => i.json);
+
+/*********************************************************************
+ * HELPER: NORMALIZE CODE-LIKE VALUES (e.g. "KOL/00279" vs "279")
+ * Strips any non-digit characters and leading zeros so different
+ * formats of the same number are treated as equal.
+ *********************************************************************/
+function normalizeCode(value) {
+    if (value === null || value === undefined) return "";
+    const digitsOnly = String(value).replace(/\D/g, "");
+    return digitsOnly.replace(/^0+/, "") || "0";
+}
+
+/*********************************************************************
+ * INVOICE JSON
+ *********************************************************************/
+const invoice = $("Code in JavaScript8").first().json;
+
+/*********************************************************************
+ * RESULT OBJECT
+ *********************************************************************/
+const result = {
+    invoice_number: invoice.invoice_number,
+    fo_number: invoice.fo_no,
+    status: "PASS",
+
+    summary: {
+        purchase_rows: purchaseRows.length,
+        invoice_trucks: invoice.line_items.length
+    },
+
+    passed: [],
+    failed: [],
+    warnings: []
+};
+
+/*********************************************************************
+ * BASIC CHECKS
+ *********************************************************************/
+
+// 1. FO Number
+const dbFO = purchaseRows.length ? purchaseRows[0].freight_order : "";
+
+if (dbFO === invoice.fo_no) {
+    result.passed.push("FO Number Matched");
+} else {
+    result.failed.push({
+        check: "FO Number",
+        invoice_data: invoice.fo_no,
+        erp_data: dbFO
+    });
+}
+
+// 2. FO Rate Check
+const dbRate = purchaseRows.length ? Number(purchaseRows[0].rate) : 0;
+const invoiceRate = Number(invoice.fo_rate || 0);
+
+if (dbRate === invoiceRate) {
+    result.passed.push("FO Rate Matched");
+} else {
+    result.failed.push({
+        check: "FO Rate",
+        invoice_data: invoiceRate,
+        erp_data: dbRate
+    });
+}
+
+// 3. FO Order Value Check
+const dbOrderValue = purchaseRows.length ? Number(purchaseRows[0].total_value) : 0;
+const invoiceOrderValue = Number(invoice.fo_order_value || 0);
+
+if (dbOrderValue === invoiceOrderValue) {
+    result.passed.push("FO Order Value Matched");
+} else {
+    result.failed.push({
+        check: "FO Order Value",
+        invoice_data: invoiceOrderValue,
+        erp_data: dbOrderValue
+    });
+}
+
+/*********************************************************************
+ * TOTAL VALUE
+ *********************************************************************/
+const dbTotal = purchaseRows.length ? Number(purchaseRows[0].total_value) : 0;
+const invoiceTotal = Number(invoice.fo_order_value || invoice.taxable_value || 0);
+
+// Calculate the absolute difference between the two amounts
+const totalDifference = Math.abs(dbTotal - invoiceTotal);
+
+// If the mismatch is less than or equal to 80 rupees, it is considered valid
+if (totalDifference <= 80) {
+    result.passed.push("Invoice Amount Matched");
+} else {
+    result.failed.push({
+        check: "Invoice Amount",
+        invoice_data: invoiceTotal,
+        erp_data: dbTotal
+    });
+}
+
+/*********************************************************************
+ * GROUP PURCHASE DATA BY VOUCHER
+ *********************************************************************/
+const purchaseMap = {};
+
+for (const row of purchaseRows) {
+    if (!purchaseMap[row.voucher_no]) {
+        purchaseMap[row.voucher_no] = {
+            voucher_no: row.voucher_no,
+            vehicle_no: row.vehicle_no,
+            lr_no: row.lr_no,
+            freight_order: row.freight_order,
+            rate: Number(row.rate),
+            qty: Number(row.qty),
+            item_codes: []
+        };
+    }
+    purchaseMap[row.voucher_no].item_codes.push(row.item_code);
+}
+
+/*********************************************************************
+ * DUPLICATE VOUCHERS
+ *********************************************************************/
+const duplicateVoucher = [];
+const seen = {};
+
+for (const r of purchaseRows) {
+    if (!seen[r.voucher_no]) {
+        seen[r.voucher_no] = 0;
+    }
+    seen[r.voucher_no]++;
+}
+
+Object.entries(seen).forEach(([k, v]) => {
+    if (v > 1) {
+        duplicateVoucher.push({
+            voucher: k,
+            rows: v
+        });
+    }
+});
+
+if (duplicateVoucher.length) {
+    result.warnings.push({
+        check: "Duplicate Purchase Rows",
+        data: duplicateVoucher
+    });
+}
+
+/*********************************************************************
+ * VALIDATE EVERY TRUCK
+ *********************************************************************/
+const matchedVoucher = [];
+
+for (const truck of invoice.line_items) {
+    // Some invoices label the voucher/gatepass number as "our_invoice_number" instead of "gatepass_no"
+    const voucher = truck.gatepass_no || truck.our_invoice_number;
+    matchedVoucher.push(voucher);
+
+    const purchase = purchaseMap[voucher];
+
+    if (!purchase) {
+        // Handle missing invoice voucher in ERP as a warning instead of a failure
+        result.warnings.push({
+            check: "Invoice Voucher Missing In ERP",
+            data: [
+                {
+                    voucher: voucher,
+                    note: "Voucher present in invoice but not found in ERP purchase data"
+                }
+            ]
+        });
+        continue;
+    }
+
+    //--------------------------------
+    // VEHICLE NUMBER
+    if (purchase.vehicle_no !== truck.truck_no) {
+        result.failed.push({
+            check: "Vehicle",
+            voucher,
+            invoice_data: truck.truck_no,
+            erp_data: purchase.vehicle_no
+        });
+    }
+
+    //--------------------------------
+    // LR / CN NUMBER
+    if (normalizeCode(purchase.lr_no) !== normalizeCode(truck.lr_no)) {
+        result.failed.push({
+            check: "LR/CN Number",
+            voucher,
+            invoice_data: truck.lr_no,
+            erp_data: purchase.lr_no
+        });
+    }
+
+    //--------------------------------
+    // FO NUMBER (per truck)
+    if (purchase.freight_order !== truck.fo_no) {
+        result.failed.push({
+            check: "FO Number",
+            voucher,
+            invoice_data: truck.fo_no,
+            erp_data: purchase.freight_order
+        });
+    }
+
+    //--------------------------------
+    // FREIGHT / RATE
+    if (purchase.rate !== Number(truck.freight)) {
+        result.failed.push({
+            check: "Freight",
+            voucher,
+            invoice_data: Number(truck.freight),
+            erp_data: purchase.rate
+        });
+    }
+
+    //--------------------------------
+    result.passed.push(voucher + " Validated");
+}
+
+/*********************************************************************
+ * MISSING PURCHASE VOUCHERS (Moved to Warnings)
+ *********************************************************************/
+Object.keys(purchaseMap).forEach(v => {
+    if (!matchedVoucher.includes(v)) {
+        result.warnings.push({
+            check: "Purchase Voucher Missing In Invoice",
+            data: [
+                {
+                    voucher: v,
+                    rows: 1 
+                }
+            ]
+        });
+    }
+});
+
+/*********************************************************************
+ * TRUCK COUNT (Moved to Warnings)
+ *********************************************************************/
+const expectedTruck = purchaseRows.length ? Number(purchaseRows[0].qty) : 0;
+const invoiceTruck = invoice.line_items.length;
+
+if (expectedTruck !== invoiceTruck) {
+    result.warnings.push({
+        check: "Truck Count",
+        data: [
+            {
+                invoice_data: invoiceTruck,
+                erp_data: expectedTruck,
+                note: `Truck count mismatch. Invoice shows ${invoiceTruck} while ERP expects ${expectedTruck}.`
+            }
+        ]
+    });
+} else {
+    result.passed.push("Truck Count Matched");
+}
+
+/*********************************************************************
+ * FINAL STATUS
+ *********************************************************************/
+if (result.failed.length) {
+    result.status = "FAILED";
+}
+
+/*********************************************************************
+ * RETURN
+ *********************************************************************/
+return [
+    {
+        json: result
+    }
+];
+
+
+// ==================================================================
+new interlock 
+``/*********************************************************************
+ * PURCHASE DATA (ERP / DB)
+ *********************************************************************/
+
+const purchaseRows = $("Execute a SQL query").all().map(i => i.json);
+
+/*********************************************************************
+ * INVOICE JSON
+ *********************************************************************/
+
+const invoice = $("Code in JavaScript8").first().json;
+
+/*********************************************************************
+ * HELPERS
+ *********************************************************************/
+
+// Normalize vehicle numbers: strip spaces/hyphens, uppercase
+function normVehicle(v) {
+    return (v || "").toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// Normalize LR numbers: extract leading numeric part, strip leading zeros
+function normLR(v) {
+    if (v === null || v === undefined) return "";
+    const match = v.toString().match(/\d+/);
+    if (!match) return "";
+    return String(parseInt(match[0], 10));
+}
+
+// Normalize numeric strings like "89950.00" -> 89950
+function normNum(v) {
+    if (v === null || v === undefined) return NaN;
+    return Number(v.toString().replace(/,/g, ""));
+}
+
+/*********************************************************************
+ * RESULT OBJECT
+ *********************************************************************/
+
+const result = {
+    invoice_number: invoice.invoice_number,
+    fo_number: invoice.fo_no,
+    status: "PASS",
+
+    summary: {
+        purchase_rows: purchaseRows.length,
+        invoice_trucks: invoice.line_items.length
+    },
+
+    passed: [],
+    failed: [],
+    warnings: []
+};
+
+/*********************************************************************
+ * BASIC CHECKS (Header Level)
+ *********************************************************************/
+
+// FO Number  (invoice.fo_no -> db.freight_order)
+
+const dbFO = purchaseRows.length ? purchaseRows[0].freight_order : "";
+const invoiceFO = invoice.fo_no;
+
+if (dbFO === invoiceFO) {
+    result.passed.push("FO Number Matched");
+} else {
+    result.failed.push({
+        check: "FO Number",
+        invoice_data: invoiceFO,
+        erp_data: dbFO
+    });
+}
+
+// FO Rate  (invoice.fo_rate -> db.rate)  -- only if present at header level
+
+if (invoice.fo_rate !== undefined) {
+
+    const dbRate = purchaseRows.length ? normNum(purchaseRows[0].rate) : NaN;
+    const invoiceRate = normNum(invoice.fo_rate);
+
+    if (dbRate === invoiceRate) {
+        result.passed.push("FO Rate Matched");
+    } else {
+        result.failed.push({
+            check: "FO Rate",
+            invoice_data: invoiceRate,
+            erp_data: dbRate
+        });
+    }
+}
+
+// FO Qty  (invoice.fo_qty -> db.qty)
+
+if (invoice.fo_qty !== undefined) {
+
+    const dbQty = purchaseRows.length ? Number(purchaseRows[0].qty) : 0;
+    const invoiceQty = Number(invoice.fo_qty);
+
+    if (dbQty === invoiceQty) {
+        result.passed.push("FO Qty Matched");
+    } else {
+        result.failed.push({
+            check: "FO Qty",
+            invoice_data: invoiceQty,
+            erp_data: dbQty
+        });
+    }
+}
+
+// FO Order Value  (invoice.fo_order_value -> db.total_value)
+
+if (invoice.fo_order_value !== undefined) {
+
+    const dbTotal = purchaseRows.length ? normNum(purchaseRows[0].total_value) : 0;
+    const invoiceTotal = normNum(invoice.fo_order_value);
+
+    if (dbTotal === invoiceTotal) {
+        result.passed.push("FO Order Value Matched");
+    } else {
+        result.failed.push({
+            check: "FO Order Value",
+            invoice_data: invoiceTotal,
+            erp_data: dbTotal
+        });
+    }
+}
+
+/*********************************************************************
+ * INDEX PURCHASE ROWS BY sale_bill_number (matching key)
+ *********************************************************************/
+
+const purchaseMap = {};
+const duplicateBill = [];
+const seen = {};
+
+for (const row of purchaseRows) {
+
+    const key = row.sale_bill_number;
+
+    if (!seen[key]) seen[key] = 0;
+    seen[key]++;
+
+    purchaseMap[key] = {
+        sale_bill_number: row.sale_bill_number,
+        vehicle_no: row.vehicle_no,
+        lr_no: row.lr_no,
+        freight_order: row.freight_order,
+        rate: normNum(row.rate),
+        qty: Number(row.qty)
+    };
+}
+
+Object.entries(seen).forEach(([k, v]) => {
+    if (v > 1) {
+        duplicateBill.push({ sale_bill_number: k, rows: v });
+    }
+});
+
+if (duplicateBill.length) {
+    result.warnings.push({
+        check: "Duplicate Sale Bill Numbers In ERP",
+        data: duplicateBill
+    });
+}
+
+/*********************************************************************
+ * VALIDATE EVERY TRUCK (matched by our_invoice_number -> sale_bill_number)
+ *********************************************************************/
+
+const matchedBillNumbers = [];
+
+for (const truck of invoice.line_items) {
+
+    const billNo = truck.our_invoice_number;
+
+    matchedBillNumbers.push(billNo);
+
+    const purchase = purchaseMap[billNo];
+
+    if (!purchase) {
+
+        result.failed.push({
+            check: "Sale Bill Number Missing",
+            invoice_data: billNo,
+            note: "our_invoice_number present in invoice but no matching sale_bill_number found in ERP"
+        });
+
+        continue;
+    }
+
+    // Track how many failures this specific truck has, so it's only
+    // marked "Validated" if it actually passed every check below.
+    const failedBefore = result.failed.length;
+
+    //--------------------------------
+    // VEHICLE NUMBER  (invoice.truck_no -> db.vehicle_no)
+
+    if (normVehicle(purchase.vehicle_no) !== normVehicle(truck.truck_no)) {
+
+        result.failed.push({
+            check: "Vehicle",
+            sale_bill_number: billNo,
+            invoice_data: truck.truck_no,
+            erp_data: purchase.vehicle_no
+        });
+
+    }
+
+    //--------------------------------
+    // LR / CN NUMBER  (invoice.lr_no -> db.lr_no)
+
+    if (normLR(purchase.lr_no) !== normLR(truck.lr_no)) {
+
+        result.failed.push({
+            check: "LR/CN Number",
+            sale_bill_number: billNo,
+            invoice_data: truck.lr_no,
+            erp_data: purchase.lr_no
+        });
+
+    }
+
+    //--------------------------------
+    // FO NUMBER (per truck)  (invoice.fo_no -> db.freight_order)
+
+    if (purchase.freight_order !== truck.fo_no) {
+
+        result.failed.push({
+            check: "FO Number",
+            sale_bill_number: billNo,
+            invoice_data: truck.fo_no,
+            erp_data: purchase.freight_order
+        });
+
+    }
+
+    //--------------------------------
+    // FREIGHT / RATE  (invoice.freight -> db.rate)
+
+    if (purchase.rate !== normNum(truck.freight)) {
+
+        result.failed.push({
+            check: "Freight Rate",
+            sale_bill_number: billNo,
+            invoice_data: normNum(truck.freight),
+            erp_data: purchase.rate
+        });
+
+    }
+
+    //--------------------------------
+
+    if (result.failed.length === failedBefore) {
+
+        result.passed.push(billNo + " Validated");
+
+    }
+
+}
+
+/*********************************************************************
+ * MISSING PURCHASE VOUCHERS (in ERP but not in invoice)
+ * Treated as a WARNING, not a failure -- these are sale bills that
+ * exist in the ERP but simply weren't billed on this invoice yet.
+ *********************************************************************/
+
+Object.keys(purchaseMap).forEach(billNo => {
+
+    if (!matchedBillNumbers.includes(billNo)) {
+
+        result.warnings.push({
+            check: "ERP Sale Bill Missing In Invoice",
+            data: [
+                {
+                    sale_bill_number: billNo,
+                    note: "sale_bill_number present in ERP purchase data but not found in invoice"
+                }
+            ]
+        });
+
+    }
+
+});
+
+/*********************************************************************
+ * TRUCK COUNT
+ *********************************************************************/
+
+const expectedTruck = purchaseRows.length ? purchaseRows.length : 0;
+const invoiceTruck = invoice.line_items.length;
+
+if (expectedTruck !== invoiceTruck) {
+
+    result.warnings.push({
+        check: "Truck Count",
+        invoice_data: invoiceTruck,
+        erp_data: expectedTruck
+    });
+
+} else {
+    result.passed.push("Truck Count Matched");
+}
+
+/*********************************************************************
+ * FINAL STATUS
+ *********************************************************************/
+
+if (result.failed.length) {
+    result.status = "FAILED";
+}
+
+/*********************************************************************
+ * RETURN
+ *********************************************************************/
+
+return [
+    {
+        json: result
+    }
+];
+
+
+
+
+
+
+
+
+
+
+
+
+
+// /*********************************************************************
+//  * PURCHASE DATA (ERP / DB)
+//  *********************************************************************/
+
+// const purchaseRows = $("Execute a SQL query2").all().map(i => i.json);
+
+// /*********************************************************************
+//  * INVOICE JSON
+//  *********************************************************************/
+
+// const invoice = $("Code in JavaScript10").first().json;
+
+// /*********************************************************************
+//  * HELPERS
+//  *********************************************************************/
+
+// // Normalize vehicle numbers: strip spaces/hyphens, uppercase
+// function normVehicle(v) {
+//     return (v || "").toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
+// }
+
+// // Normalize LR numbers: extract leading numeric part, strip leading zeros
+// function normLR(v) {
+//     if (v === null || v === undefined) return "";
+//     const match = v.toString().match(/\d+/);
+//     if (!match) return "";
+//     return String(parseInt(match[0], 10));
+// }
+
+// // Normalize numeric strings like "89950.00" -> 89950
+// function normNum(v) {
+//     if (v === null || v === undefined) return NaN;
+//     return Number(v.toString().replace(/,/g, ""));
+// }
+
+// /*********************************************************************
+//  * RESULT OBJECT
+//  *********************************************************************/
+
+// const result = {
+//     invoice_number: invoice.invoice_number,
+//     fo_number: invoice.fo_no,
+//     status: "PASS",
+
+//     summary: {
+//         purchase_rows: purchaseRows.length,
+//         invoice_trucks: invoice.line_items.length
+//     },
+
+//     passed: [],
+//     failed: [],
+//     warnings: []
+// };
+
+// /*********************************************************************
+//  * BASIC CHECKS (Header Level)
+//  *********************************************************************/
+
+// // FO Number  (invoice.fo_no -> db.freight_order)
+
+// const dbFO = purchaseRows.length ? purchaseRows[0].freight_order : "";
+// const invoiceFO = invoice.fo_no;
+
+// if (dbFO === invoiceFO) {
+//     result.passed.push("FO Number Matched");
+// } else {
+//     result.failed.push({
+//         check: "FO Number",
+//         invoice_data: invoiceFO,
+//         erp_data: dbFO
+//     });
+// }
+
+// // FO Rate  (invoice.fo_rate -> db.rate)  -- only if present at header level
+
+// if (invoice.fo_rate !== undefined) {
+
+//     const dbRate = purchaseRows.length ? normNum(purchaseRows[0].rate) : NaN;
+//     const invoiceRate = normNum(invoice.fo_rate);
+
+//     if (dbRate === invoiceRate) {
+//         result.passed.push("FO Rate Matched");
+//     } else {
+//         result.failed.push({
+//             check: "FO Rate",
+//             invoice_data: invoiceRate,
+//             erp_data: dbRate
+//         });
+//     }
+// }
+
+// // FO Qty  (invoice.fo_qty -> db.qty)
+
+// if (invoice.fo_qty !== undefined) {
+
+//     const dbQty = purchaseRows.length ? Number(purchaseRows[0].qty) : 0;
+//     const invoiceQty = Number(invoice.fo_qty);
+
+//     if (dbQty === invoiceQty) {
+//         result.passed.push("FO Qty Matched");
+//     } else {
+//         result.failed.push({
+//             check: "FO Qty",
+//             invoice_data: invoiceQty,
+//             erp_data: dbQty
+//         });
+//     }
+// }
+
+// // FO Order Value  (invoice.fo_order_value -> db.total_value)
+
+// if (invoice.fo_order_value !== undefined) {
+
+//     const dbTotal = purchaseRows.length ? normNum(purchaseRows[0].total_value) : 0;
+//     const invoiceTotal = normNum(invoice.fo_order_value);
+
+//     if (dbTotal === invoiceTotal) {
+//         result.passed.push("FO Order Value Matched");
+//     } else {
+//         result.failed.push({
+//             check: "FO Order Value",
+//             invoice_data: invoiceTotal,
+//             erp_data: dbTotal
+//         });
+//     }
+// }
+
+// /*********************************************************************
+//  * INDEX PURCHASE ROWS BY sale_bill_number (matching key)
+//  *********************************************************************/
+
+// const purchaseMap = {};
+// const duplicateBill = [];
+// const seen = {};
+
+// for (const row of purchaseRows) {
+
+//     const key = row.sale_bill_number;
+
+//     if (!seen[key]) seen[key] = 0;
+//     seen[key]++;
+
+//     purchaseMap[key] = {
+//         sale_bill_number: row.sale_bill_number,
+//         vehicle_no: row.vehicle_no,
+//         lr_no: row.lr_no,
+//         freight_order: row.freight_order,
+//         rate: normNum(row.rate),
+//         qty: Number(row.qty)
+//     };
+// }
+
+// Object.entries(seen).forEach(([k, v]) => {
+//     if (v > 1) {
+//         duplicateBill.push({ sale_bill_number: k, rows: v });
+//     }
+// });
+
+// if (duplicateBill.length) {
+//     result.warnings.push({
+//         check: "Duplicate Sale Bill Numbers In ERP",
+//         data: duplicateBill
+//     });
+// }
+
+// /*********************************************************************
+//  * VALIDATE EVERY TRUCK (matched by our_invoice_number -> sale_bill_number)
+//  *********************************************************************/
+
+// const matchedBillNumbers = [];
+
+// for (const truck of invoice.line_items) {
+
+//     const billNo = truck.our_invoice_number;
+
+//     matchedBillNumbers.push(billNo);
+
+//     const purchase = purchaseMap[billNo];
+
+//     if (!purchase) {
+
+//         result.failed.push({
+//             check: "Sale Bill Number Missing",
+//             invoice_data: billNo,
+//             note: "our_invoice_number present in invoice but no matching sale_bill_number found in ERP"
+//         });
+
+//         continue;
+//     }
+
+//     // Track how many failures this specific truck has, so it's only
+//     // marked "Validated" if it actually passed every check below.
+//     const failedBefore = result.failed.length;
+
+//     //--------------------------------
+//     // VEHICLE NUMBER  (invoice.truck_no -> db.vehicle_no)
+
+//     if (normVehicle(purchase.vehicle_no) !== normVehicle(truck.truck_no)) {
+
+//         result.failed.push({
+//             check: "Vehicle",
+//             sale_bill_number: billNo,
+//             invoice_data: truck.truck_no,
+//             erp_data: purchase.vehicle_no
+//         });
+
+//     }
+
+//     //--------------------------------
+//     // LR / CN NUMBER  (invoice.lr_no -> db.lr_no)
+
+//     if (normLR(purchase.lr_no) !== normLR(truck.lr_no)) {
+
+//         result.failed.push({
+//             check: "LR/CN Number",
+//             sale_bill_number: billNo,
+//             invoice_data: truck.lr_no,
+//             erp_data: purchase.lr_no
+//         });
+
+//     }
+
+//     //--------------------------------
+//     // FO NUMBER (per truck)  (invoice.fo_no -> db.freight_order)
+
+//     if (purchase.freight_order !== truck.fo_no) {
+
+//         result.failed.push({
+//             check: "FO Number",
+//             sale_bill_number: billNo,
+//             invoice_data: truck.fo_no,
+//             erp_data: purchase.freight_order
+//         });
+
+//     }
+
+//     //--------------------------------
+//     // FREIGHT / RATE  (invoice.freight -> db.rate)
+
+//     if (purchase.rate !== normNum(truck.freight)) {
+
+//         result.failed.push({
+//             check: "Freight Rate",
+//             sale_bill_number: billNo,
+//             invoice_data: normNum(truck.freight),
+//             erp_data: purchase.rate
+//         });
+
+//     }
+
+//     //--------------------------------
+
+//     if (result.failed.length === failedBefore) {
+
+//         result.passed.push(billNo + " Validated");
+
+//     }
+
+// }
+
+// /*********************************************************************
+//  * MISSING PURCHASE VOUCHERS (in ERP but not in invoice)
+//  * Treated as a WARNING, not a failure -- these are sale bills that
+//  * exist in the ERP but simply weren't billed on this invoice yet.
+//  *********************************************************************/
+
+// Object.keys(purchaseMap).forEach(billNo => {
+
+//     if (!matchedBillNumbers.includes(billNo)) {
+
+//         result.warnings.push({
+//             check: "ERP Sale Bill Missing In Invoice",
+//             data: [
+//                 {
+//                     sale_bill_number: billNo,
+//                     note: "sale_bill_number present in ERP purchase data but not found in invoice"
+//                 }
+//             ]
+//         });
+
+//     }
+
+// });
+
+// /*********************************************************************
+//  * TRUCK COUNT
+//  *********************************************************************/
+
+// const expectedTruck = purchaseRows.length ? purchaseRows.length : 0;
+// const invoiceTruck = invoice.line_items.length;
+
+// if (expectedTruck !== invoiceTruck) {
+
+//     result.warnings.push({
+//         check: "Truck Count",
+//         invoice_data: invoiceTruck,
+//         erp_data: expectedTruck
+//     });
+
+// } else {
+//     result.passed.push("Truck Count Matched");
+// }
+
+// /*********************************************************************
+//  * FINAL STATUS
+//  *********************************************************************/
+
+// if (result.failed.length) {
+//     result.status = "FAILED";
+// }
+
+// /*********************************************************************
+//  * RETURN
+//  *********************************************************************/
+
+// return [
+//     {
+//         json: result
+//     }
+// ];
+
+
+
+IMPORTAND PROMPT FOR OCR
+You are an expert invoice data extraction assistant specializing in high-precision logistics and accounting document parsing.
+
+Analyze the provided invoice document carefully and extract all visible or derived information with extreme accuracy. Do not skip fields, and strictly follow the conditional business logic rules provided below.
+
+🔴 CRITICAL RULES
+1. Output Format: Return ONLY a valid JSON object. No markdown wrapping, no markdown code-blocks (```json), no explanation, no extra text.
+2. No Hallucination Rule: If a field is not explicitly present or cannot be confidently derived via the business rules → return null.
+3. Text Preservation: Keep original spelling, formatting, and case exactly as in the document.
+4. Normalization Rules:
+   - Dates → YYYY-MM-DD
+   - Numbers → standard numeric format (e.g., 13.920 to 13.92)
+5. Multi-Row / Multi-Item Rule (IMPORTANT):
+   - If the invoice table contains more than one row under Sl.no (i.e., multiple trucks/consignments billed on one invoice), DO NOT collapse them into single scalar fields.
+   - Instead, emit a "line_items" array, with ONE object per ACTUAL consignment/Sl.no/C.N.No — never one object per amount line. The number of line_items objects must equal the number of consignments on the invoice (e.g., 4 consignments → 4 line_items objects, not 8).
+   - Each object contains exactly these row-level fields: date, truck_no, fo_no, description, lr_no, type, gatepass_no, our_invoice_number, freight, st_charges.
+   - All other fields that are invoice-level (appear once, above/below the table — e.g., invoice_number, buyer_name, GSTIN, total, payable amount) remain single scalar fields, NOT arrays.
+   - If the invoice has only one row, still return "line_items" as an array with a single object (for consistent schema).
+5b. ST CHARGES Isolation Rule (IMPORTANT):
+   - On this invoice format, a single consignment (one C.N.No/Sl.no) is often printed as TWO stacked amount lines: (1) the main weight-based freight line, aligned with the Pkgs/Weight/Rate columns and its Amount value (e.g., "20 DRUM 13.000MT. 89950.00 → 89950.00"), and (2) an additional "ST CHARGES" surcharge line printed directly beneath it with its own smaller Amount value (e.g., "ST CHARGES ... → 100.00"), usually with "..." / blank placeholders in the Pkgs/Weight/Rate columns for that second line.
+   - These two amounts belong to the SAME consignment. Do NOT create a second line_items object for the ST CHARGES line — that inflates the consignment count (e.g., turning 4 real consignments into 8 rows), which is wrong.
+   - Instead, keep ONE line_items object per consignment, and capture the ST CHARGES amount in that same object's isolated "st_charges" field:
+     - "freight" = the main weight-based Amount value for that consignment (e.g., 89950.00).
+     - "st_charges" = the ST CHARGES Amount value for that same consignment (e.g., 100.00). If no ST CHARGES line is printed for a given consignment, return null for that row's st_charges.
+   - Do NOT swap these two values — the larger amount aligned with the weight/rate columns always goes to "freight"; the smaller standalone amount below it always goes to "st_charges". Double-check each pair before finalizing output.
+   - "description" for the row should reflect the actual route/cargo description text for that consignment (e.g., destination or item description) — do NOT set description to "WT CHARGES" or "ST CHARGES"; those are amount-line labels, not the consignment's description.
+   - HARD CONSTRAINT: never emit two line_items objects that share the same lr_no — if you find yourself about to output two objects with identical lr_no differing only by "description": "WT CHARGES" vs "description": "ST CHARGES", STOP and merge them into ONE object instead.
+   - ❌ INCORRECT (do not do this):
+     [{"lr_no":"0012/26-27","description":"WT CHARGES","freight":89950}, {"lr_no":"0012/26-27","description":"ST CHARGES","freight":100}]
+   - ✅ CORRECT (one merged object per consignment):
+     [{"lr_no":"0012/26-27","description":"KOLLAM","freight":89950,"st_charges":100}]
+6. FIELD DISAMBIGUATION RULE (IMPORTANT — three distinct code fields, do not confuse):
+   - "lr_no" = "cn_lr_no": These are THE SAME THING (Lorry Receipt number = Consignment Note number). Only ever populate ONE value for this — never invent two different LR/CN values for the same row. It is typically a short number found under a column literally labeled "LR NO" or "CN NO" (e.g., "364", "363").
+   - "gatepass_no": A code found under a column literally labeled "GATEPASS NO" (e.g., "L126406-007"), OR — if no such column exists — found embedded in the description text matching pattern: 2-4 uppercase letters + digits/dashes (e.g., L1, L2, LP, LK, LT, BS26 followed by numbers).
+   - "our_invoice_number": A code that looks similar to gatepass_no in format (uppercase letters + digits + dashes, e.g., "L125313-004") BUT specifically represents the TRANSPORTER'S OWN internal invoice/bill reference number for this consignment — NOT the buyer-facing lr_no, and NOT necessarily the same as gatepass_no. It typically starts with one of the same prefix families as gatepass_no — L1, L2, LP, LK, LT, or BS26 — followed by digits/dashes (e.g., "L125313-004", "BS26-01123"). The prefix alone does NOT tell you whether a code is gatepass_no or our_invoice_number — both fields share this same prefix vocabulary. What disambiguates them is LOCATION/LABEL on the document: look for this near "Invoice No.", "Our Bill No.", or similar labels on the LR/consignment note pages (separate from the main tax invoice's invoice_number field, which is the formal GST invoice number like "003/26-27").
+   - If only one such alphanumeric code is visible and it's unclear which of gatepass_no / our_invoice_number it represents, prefer classifying it as our_invoice_number if it appears on a consignment note / LR page (not the main tax invoice table), and as gatepass_no if it appears specifically under a "GATEPASS NO" column on the main tax invoice table.
+
+📌 FIELD EXTRACTION LOGIC
+
+🧾 CORE INVOICE FIELDS (invoice-level, scalar)
+- invoice_number: Value after "Bill No:" / "Invoice NO" on the main tax invoice header (the formal GST invoice number, e.g., "003/26-27")
+- invoice_date: Date associated with invoice/bill
+- buyer_name: Extract from "Messers:" / "Name" under Bill to Party
+- transporter_name: Top header company name
+- transporter_gstin: The GSTIN printed on the letterhead/header of the invoice, next to or below the transporter's company name. This is DIFFERENT from the buyer's GSTIN listed under "Bill to Party" — do not confuse the two.
+- pan_number: The transporter's PAN (Permanent Account Number). STEP-BY-STEP —
+  1. If a PAN is explicitly printed on the document under a label like "PAN NO", "PAN", or "Permanent Account No." (usually near the transporter's GSTIN on the letterhead) → extract that value exactly as printed.
+  2. If no explicit PAN label/value is found, DERIVE it from transporter_gstin: a valid 15-character GSTIN embeds the 10-character PAN at positions 3–12 (i.e., characters 3 through 12 inclusive). Extract those 10 characters as pan_number.
+  3. Do NOT derive from the buyer's GSTIN — only ever from the transporter's letterhead GSTIN (same source as transporter_gstin).
+  4. If transporter_gstin is missing, malformed (not 15 characters), or no explicit PAN is printed → return null. Do not guess or fabricate.
+  5. Text Preservation still applies: return PAN in uppercase exactly as it appears/derives (PAN format is always uppercase letters+digits, e.g., "ABCDE1234F").
+- driver_num: Driver mobile number (if explicitly mentioned)
+- to_place_name: Destination place name (routing section)
+- address: Full buyer address under Messers/Bill to Party (single line)
+- item_name: Cargo/material description (e.g., "3 CORE * 185 SQ") — only extract if legible/unambiguous; if handwritten and unclear, return null rather than guess
+- drum_qty: WEIGHT column value (keep text like FIXED as-is)
+
+📄 FO PAGE FIELDS (invoice-level, scalar — extracted from the attached FREIGHT ORDER page, when present)
+The FREIGHT ORDER page is a distinct document (header literally reads "FREIGHT ORDER") with its own table containing columns: Sr. No, Order Number, From Place, To Place, Valid (From Date / To Date), Rate, Quantity Lift, Order Value, Trips. Extract the following directly from that table row, using these exact column mappings:
+- fo_order_number: Value under the "Order Number" column (e.g., "D125Y-2185"). This is DIFFERENT from fo_no (the header "F.O. No." field, e.g., "FO264-00041") — the two are separate identifiers on the same page; do not confuse or merge them.
+- fo_from_place: Value under the "From Place" column (e.g., "Dhulagarh").
+- fo_to_place: Value under the "To Place" column (e.g., "Kollam").
+- fo_rate: Value under the "Rate" column for that order row (e.g., "89,950.00" → 89950.00). Extract exactly as printed, normalized per numeric rules (strip commas). This is the FO page's per-trip rate — do NOT confuse with per-consignment "freight" amounts on the main tax invoice table.
+- fo_qty: Value under the "Quantity Lift" column for that order row (e.g., "8.000" → 8.000). Extract exactly as printed, normalized per numeric rules.
+- fo_order_value: Value under the "Order Value" column for that order row (e.g., "7,19,600.00" → 719600.00). Extract exactly as printed, normalized per numeric rules (strip commas — Indian lakh-style comma grouping is common here, e.g., "7,19,600.00"). ALWAYS use this explicitly printed value rather than computing it — only compute as a fallback (fo_rate × fo_qty) if no explicit Order Value is printed on that row but both fo_rate and fo_qty are present.
+- If no FREIGHT ORDER page is attached/present, or a given value is not legible, return null for that field rather than guessing.
+- If the FO page table has multiple order rows (multiple Sr. No entries) with different rate/qty/order value combinations, return fo_order_number, fo_from_place, fo_to_place, fo_rate, fo_qty, and fo_order_value as arrays (in matching, aligned order) instead of single scalar values. If there is only one order row, keep them as single scalars.
+
+📦 LINE ITEM FIELDS (row-level, inside "line_items" array)
+- date: Date for that specific row
+- truck_no: Indian vehicle registration format (WB, JH, etc.) for that row
+- fo_no: Freight Order No. for that row. IMPORTANT — do NOT identify this purely by "starts with capital F"; a Trade Bill No. / Bill No. or other reference code can also start with "F" and must not be confused with the FO number. Only treat a value as fo_no if it is explicitly associated with a label containing "FO" (e.g., "FO No.", "F.O. No.", "Freight Order No.", "FO Number") — either directly in that row/column, or via the master-FO fallback below. If a value starts with "F" but its actual label says "Trade Bill No.", "Bill No.", or anything unrelated to "FO"/"Freight Order", do NOT extract it as fo_no. If the table itself has no distinct per-row FO value, but a single master FO number is printed elsewhere on the document under an FO-labeled reference (e.g., in an ENCL footnote like "FO No.-FO264-00041", or on an attached Freight Order page), use that same master FO number for every row instead of returning null (see invoice-level fo_no rule below for extraction details).
+- description: Route/cargo description for that row
+- lr_no: Lorry Receipt / CN number for that row (same as cn_lr_no — see Field Disambiguation Rule above). Usually a short number, not a long alphanumeric code.
+- type: Vehicle/load type for that row (e.g., 10Wh, 12Wh)
+- gatepass_no: See Field Disambiguation Rule above (column-based or embedded-pattern fallback)
+- our_invoice_number: See Field Disambiguation Rule above — transporter's own internal invoice reference for this consignment
+- freight: FRIGHT/Freight value for that row (main weight-based amount — see ST CHARGES Isolation Rule above)
+- st_charges: The ST CHARGES surcharge amount for that same consignment row, isolated from freight (see ST CHARGES Isolation Rule above). null if no ST CHARGES line is printed for that row.
+
+📦 ACCOUNTING + ENTITY EXTRACTION FIELDS (invoice-level, scalar)
+- party_code: Extract if present
+- party_name: Extract from "Messers:" or transport vendor name depending on context
+- party_slno: Extract if present
+- party_reg_addr: The TRANSPORTER's own registered address — i.e., the address printed on the invoice letterhead/header, next to or below the transporter's company name (same source location as transporter_gstin). Do NOT use the "Bill to Party" / Messers address for this field — that is the buyer's side ("our" side), already covered separately by our_reg_addr. If the letterhead address is not legible or not present, return null rather than substituting the buyer's address.
+- our_slno: Extract if present
+- our_reg_addr: Hardcode to exactly "19th Floor, Adventz Infinty@ 5,BN BLOCK Saltlake Sector - v,Kolkata,700091." if identifying the internal company address
+- fo_no: Extract the overall/master FO number if present (distinct from per-row fo_no if they differ). STEP-BY-STEP:
+  1. Look for this near labels such as "FO No.", "F.O. No.", "FO Number", or "FO No.-" ANYWHERE on the document — this explicitly includes ENCL/Enclosure footnotes printed below or beside the main invoice table (e.g., "ENCL : 1. FO No.-FO264-00041"), not only a dedicated header field near the top.
+  2. The label and value are sometimes joined directly by a hyphen/dash with no space (e.g., "FO No.-FO264-00041"). In that case the extracted value is everything after the label/dash, i.e. "FO264-00041".
+  3. The extracted value keeps its own leading "FO" characters intact as part of the code (e.g., "FO264-00041") — do not strip them; they are part of the identifier itself, not a restatement of the label.
+  4. If a separate attached Freight Order page/document is present showing "F.O. No. : FO264-00041", cross-check it against the ENCL note on the tax invoice — they should match; use this as confirmation, not a separate field.
+  5. If every line_item row in the table shares this same single master FO number (i.e., no distinct per-row FO value is printed inside the table itself), also populate each line item's row-level "fo_no" with this same master value — do not leave per-row fo_no as null just because it was only printed once, in a footnote, for the whole invoice.
+  6. If an attached FREIGHT ORDER page is present, also extract fo_order_number, fo_from_place, fo_to_place, fo_rate, fo_qty, and fo_order_value from it per the "FO PAGE FIELDS" section above. Note fo_order_number (e.g., "D125Y-2185") is a different code from this master fo_no (e.g., "FO264-00041") — both should be extracted, not merged.
+
+⚙️ COMPLEX BUSINESS & ACCOUNTING LOGIC RULES
+
+🔹 tnature (Transaction Nature)
+Determine by applying the first matching rule below:
+
+1. Route/Location Keyword Check (PRIMARY — use fuzzy/keyword matching, not exact phrase matching):
+   - Scan the route/description text (from both the main invoice table AND the second-page material description) for the presence of the keywords KHARAGPUR, DHULAGARH, and HOWRAH — in any order, any spacing, any surrounding words (e.g., "KGP TO DHULAGARH TRANSPORT", "DHULAGARH-KHARAGPUR", "EX-KHARAGPUR TO HOWRAH" all count as matches). Do NOT require an exact string match against a fixed phrase.
+   - If the route mentions KHARAGPUR and (DHULAGARH or HOWRAH) together, in either direction → "Interlock transfer"
+   - Else if the route mentions DHULAGARH and some other place that is NOT Kharagpur/Howrah, with DHULAGARH as the origin → "Sales Related"
+   - Else if the route mentions some other place that is NOT Kharagpur/Howrah as origin, going TO Dhulagarh or Kharagpur → "Purchase related"
+
+2. Gatepass NO. prefix (FALLBACK ONLY — use this ONLY if step 1 found NONE of the keywords KHARAGPUR, DHULAGARH, or HOWRAH anywhere in the route/description text at all):
+   - If gatepass_no starts with L1 / L2 → "Interlock transfer"
+   - If gatepass_no starts with BS26 → "Purchase related"
+   - If gatepass_no starts with LP / LK / LT → "Sales Related"
+
+3. Else → null
+
+IMPORTANT: Step 2 (gatepass fallback) must NEVER override Step 1. If KHARAGPUR, DHULAGARH, or HOWRAH appears anywhere in the route text (main table OR second-page description), the result MUST come from Step 1's route logic — regardless of what the gatepass_no prefix would otherwise suggest. A BS26-style gatepass prefix does not automatically mean "Purchase related" if the route text clearly indicates an interlock move between Kharagpur and Dhulagarh/Howrah.
+
+(If multiple line items have different routes/gatepass prefixes, evaluate tnature per row logic first; if all rows agree, report a single invoice-level tnature; if rows disagree, return tnature as an array aligned to line_items instead of a single value.)
+
+🔹 Accounting & Service Mappings
+- Expense_acc_code: Last provided value in document (if present, else null)
+- Expense_acc_name:
+  - Look at the second-page material description text.
+  - STEP-BY-STEP:
+    1. If the text contains "DRUM" or "DRUMP" (case-insensitive, allow spacing/hyphenation variants like "DRUM'S", "DRUM-", etc.) anywhere in the second-page description → "Drump"
+    2. Otherwise (no DRUM/DRUMP keyword found anywhere in the second-page description) → "Raw Material"
+  - Do NOT look for "RAW MATERIAL" as a positive keyword match — treat "Raw Material" as the default outcome whenever DRUM/DRUMP is absent, not as something that needs its own explicit text match.
+- Sub_acc_code: Extract if present
+- Sub_acc_name: Map to the extracted [buyer_name / party_name]
+- service_acc_name: If the text "TRANSPORT" (or common misspelling "TRANFPORT") is present anywhere → "GOODS TRANFORT", else null
+- sac_code: STEP-BY-STEP —
+  1. Look for an explicit SAC code anywhere on the document (labeled "SAC", "SAC CODE", "SAC No.", or similar), whether printed as a raw number (e.g., "996791") or already prefixed (e.g., "SAC_996791", "SAC 996791"). These are the SAME value — "SAC_996791" and "996791" must be treated as identical, not as different codes.
+  2. Normalize whatever is found: strip any existing "SAC_" / "SAC " prefix and any non-numeric characters, then output as "SAC_" followed by just the numeric digits. The "SAC_" prefix in the source text is optional/not mandatory — its presence or absence does not change the extracted value.
+  3. If no SAC code is explicitly present anywhere on the document, do NOT return null for this field — default to "SAC_996791".
+
+🔹 Series, Tax, and State-Specific Fields
+- series: Determine by applying the first matching rule below:
+  1. Route/tnature-based (PRIMARY — check this first):
+     - If resolved tnature = "Purchase related" → "INWARD"
+     - If resolved tnature = "Interlock transfer" AND route is KHARAGPUR -> DHULAGARH / HOWRAH → "INWARD"
+     - If resolved tnature = "Interlock transfer" AND route is DHULAGARH -> KHARAGPUR → "OUTWARD"
+     - If resolved tnature = "Sales Related" → "OUTWARD"
+  2. Gatepass prefix fallback (only if route/tnature above could not be resolved):
+     - If gatepass_no starts with L1 / L2 / BS26 → "INWARD"
+     - If gatepass_no starts with LP / LK / LT → "OUTWARD"
+  3. Else → null
+  (If routes/tnature differ across line_items, return series as an array aligned to line_items instead of a single value.)
+- div_code: Always default to "UNIT1"
+- addon_code_str: For freight bills, map to "GST15"
+- stax_code_str: Extract the first two numeric digits of the transporter_gstin (State Code)
+- bill_freight_val: Total freight value / Trade value for the invoice (sum across line items if shown as a total on the invoice)
+- taxable_value: Taxable value / Basic value — only if explicitly stated; do not back-calculate from freight total
+- tds_percent: STEP-BY-STEP —
+  1. Use transporter_gstin (the letterhead GSTIN, NOT the buyer's GSTIN under Bill to Party).
+  2. A valid GSTIN is 15 characters. Count characters left to right starting at position 1.
+  3. Take the character at position 6.
+  4. Apply mapping:
+     - Position 6 = "P" or "H" → "1%"
+     - Position 6 = "C" or "F" → "2%"
+     - Any other letter → null
+  5. Do NOT return null just because two GSTINs appear on the document — always resolve to the transporter's letterhead GSTIN specifically before applying this rule.
+- tds_value: Calculated or extracted TDS value — only if explicitly stated on the document; do not compute from tds_percent unless a taxable_value is also explicitly present, in which case tds_value = taxable_value × tds_percent
+- net_payable: Final invoice value including all charges (PAYABLE AMOUNT / TOTAL)
+
+- RCM: STEP-BY-STEP —
+  1. FIRST, scan the entire document for an explicit statement that GST is payable by the recipient/billed party under Reverse Charge Mechanism — e.g., "Goods & Service Tax [Rs. ...] is Payble/Payable by the billed PARTY under RCM", "payable by consignee under RCM", "recipient to pay tax under RCM", "under reverse charge", or similar wording (allow spelling variants like "Payble" for "Payable"). This statement can appear even when CGST/SGST/IGST amounts ARE explicitly shown as numeric values on the invoice — an invoice can charge GST numerically AND still declare it payable by the party under RCM; these are not contradictory.
+     - If such an explicit RCM-payable statement is found anywhere on the document → RCM = "5%". This overrides everything in steps 2–3 below, regardless of whether GST amounts are numerically shown.
+  2. If NO such explicit RCM statement is found, check cgst_amount / sgst_amount / igst_amount (as extracted above).
+     - If all three are null → treat this as a NON-GST bill (no GST charged).
+     - If any one of them is a real non-null numeric value → treat this as a GST bill.
+  3. If it is a NON-GST bill (per step 2):
+     a. Take stax_code_str (first two digits of transporter_gstin).
+     b. If stax_code_str = "19" (West Bengal/Kolkata) → RCM = "5%" (default — always apply, never null here).
+     c. If stax_code_str is any other state code → RCM = null (unless explicit document text states otherwise).
+  4. If it is a GST bill (per step 2, and no explicit RCM statement found in step 1) → RCM = null.
+  5. Never return null when step 1's explicit RCM statement is found, or when step 3b's "19" + non-GST condition applies — both must always resolve to "5%".
+
+
+- cgst_amount: CGST amount explicitly printed on the invoice.
+  - If the field is blank, shows "NIL", or says "with consignor" → return null (do NOT return 0).
+  - If a real numeric value is printed (e.g., "1250.00") → extract exactly as shown, normalized per numeric rules (e.g., "1,250.00" → 1250.00).
+- sgst_amount: SGST amount explicitly printed on the invoice. Same NIL/blank/with-consignor → null rule as cgst_amount.
+- igst_amount: IGST amount explicitly printed on the invoice. Same NIL/blank/with-consignor → null rule as cgst_amount.
+- gst_type: Derive from which of the above is populated —
+  - If igst_amount is non-null and cgst_amount/sgst_amount are null → "IGST"
+  - If cgst_amount and sgst_amount are both non-null and igst_amount is null → "CGST_SGST"
+  - If all three are null (NIL/blank/with consignor) → "NONE"
+  - If none of CGST/SGST/IGST labels appear anywhere on the document at all → null
+
+- Service_acc_code: Extract if visible, else null
+- st_charges (invoice-level): The TOTAL of all per-row st_charges values summed across line_items (distinct from the row-level "st_charges" field inside each line_items object — this one is the invoice-wide sum). If no ST CHARGES lines are present anywhere, return null.
+
+Output a single JSON block conforming exactly to these fields, with per-row data nested under "line_items" as described above.
+
+
+
+
+
+
+
+
+
+
+
+
+/*********************************************************************
+ * GRN VALIDATION (FIXED)
+ *
+ * INPUT 1 : Execute a SQL query (GRN + FO Engine Data)
+ * INPUT 2 : Code in JavaScript8 (Invoice JSON)
+ *
+ * FIXES:
+ *  1. FO Number check is now ALWAYS performed (previously wrapped in
+ *     `if(invoice.fo_no)` -> a missing fo_no silently skipped the
+ *     check and let the row PASS). Missing fo_no is now a failure.
+ *
+ *  2. Rate / Freight validation now supports TWO FO types instead of
+ *     assuming every row is weight-based:
+ *       - WEIGHT-BASED FO : erp.weight present -> rate is stored in
+ *         "per-tonne" form (e.g. invoice 2250 == erp 2.25), so we
+ *         scale by 1000 and multiply by weight_charged.
+ *       - QTY / FIXED-RATE FO : erp.weight is null/0 (e.g. your
+ *         sample: rate 8800.00, qty 1, weight null) -> rate is
+ *         compared DIRECTLY (no /1000 or *1000 scaling) and
+ *         freight = rate * qty.
+ *     Previously the code always divided/multiplied by 1000, which
+ *     is why a fixed-rate row like yours (8800 vs 8800) failed.
+ *********************************************************************/
+
+/*********************************************************************
+ * ERP DATA
+ *********************************************************************/
+
+const grnRows = $("Execute a SQL query13").all().map(i => i.json);
+
+/*********************************************************************
+ * INVOICE JSON
+ *********************************************************************/
+
+const invoice = $("Code in JavaScript46").first().json;
+
+/*********************************************************************
+ * RESULT
+ *********************************************************************/
+
+const result = {
+
+    invoice_number: invoice.invoice_number,
+    transporter: invoice.transporter_name,
+    status: "PASS",
+
+    summary: {
+        invoice_rows: invoice.line_items.length,
+        grn_rows: grnRows.length,
+        matched: 0,
+        failed: 0
+    },
+
+    passed: [],
+    failed: [],
+    warnings: []
+
+};
+
+/*********************************************************************
+ * HELPERS
+ *********************************************************************/
+
+function normalizeVehicle(v){
+    return String(v || "")
+        .replace(/[^A-Za-z0-9]/g,"")
+        .toUpperCase();
+}
+
+function normalizeLR(v){
+    return String(v || "").replace(/[^0-9]/g,"");
+}
+
+function round2(v){
+    return Number(Number(v).toFixed(2));
+}
+
+function isWeightBasedFO(erp){
+    // Weight-based FO has a real numeric weight on the GRN row.
+    const w = Number(erp.weight);
+    return erp.weight !== null && erp.weight !== undefined && !isNaN(w) && w > 0;
+}
+
+/*
+ * Transporter codes that ship via courier / non-vehicle modes, so
+ * there's no vehicle number to expect on the invoice. Add more
+ * codes here as you find them (e.g. other courier transporters).
+ */
+const NO_VEHICLE_TRANSPORTERS = ["TOM08"];
+
+function vehicleNotApplicable(erp){
+    const code = String(erp.transporter || erp.party_code || "").trim().toUpperCase();
+    return NO_VEHICLE_TRANSPORTERS.includes(code);
+}
+
+/*********************************************************************
+ * MAP ERP BY BILL NUMBER
+ *********************************************************************/
+
+const grnMap = {};
+
+for(const row of grnRows){
+    grnMap[String(row.bill_number).trim()] = row;
+}
+
+/*********************************************************************
+ * DUPLICATE BILL CHECK
+ *********************************************************************/
+
+const duplicate = {};
+
+for(const row of grnRows){
+    duplicate[row.bill_number] = (duplicate[row.bill_number] || 0) + 1;
+}
+
+Object.entries(duplicate).forEach(([bill,count])=>{
+    if(count>1){
+        result.warnings.push({
+            check:"Duplicate Bill Number",
+            bill_number:bill,
+            rows:count
+        });
+    }
+});
+
+/*********************************************************************
+ * VALIDATE EVERY LINE
+ *********************************************************************/
+
+for(const truck of invoice.line_items){
+
+    const bill = truck.our_invoice_number;
+    const erp = grnMap[bill];
+
+    if(!erp){
+        result.failed.push({
+            bill_number:bill,
+            status:"FAILED",
+            reason:"Bill Number Not Found In GRN"
+        });
+        result.summary.failed++;
+        continue;
+    }
+
+    const checks = [];
+
+    /***************************************************
+     * FO NUMBER  (always checked, missing = failure)
+     ***************************************************/
+
+    const invoiceFO = invoice.fo_no ? String(invoice.fo_no).trim() : "";
+    const erpFO = erp.freight_order ? String(erp.freight_order).trim() : "";
+
+    if(!invoiceFO){
+        checks.push({
+            field:"FO Number",
+            match:false,
+            reason:"FO Number Missing On Invoice",
+            invoice: invoice.fo_no,
+            erp: erp.freight_order
+        });
+    } else {
+        checks.push({
+            field:"FO Number",
+            match: invoiceFO === erpFO,
+            invoice: invoice.fo_no,
+            erp: erp.freight_order
+        });
+    }
+
+    /***************************************************
+     * BILL NUMBER
+     ***************************************************/
+
+    checks.push({
+        field:"Bill Number",
+        match: String(erp.bill_number).trim() === String(bill).trim(),
+        invoice:bill,
+        erp:erp.bill_number
+    });
+
+    /***************************************************
+     * LR NUMBER
+     ***************************************************/
+
+    checks.push({
+        field:"LR Number",
+        match: normalizeLR(truck.lr_no) === normalizeLR(erp.lr_no),
+        invoice:truck.lr_no,
+        erp:erp.lr_no
+    });
+
+    /***************************************************
+     * VEHICLE
+     ***************************************************/
+
+    if(!truck.truck_no && vehicleNotApplicable(erp)){
+
+        checks.push({
+            field:"Vehicle",
+            match:true,
+            reason:"Vehicle Not Applicable (Courier Transporter)",
+            invoice:truck.truck_no,
+            erp:erp.vehicle_no
+        });
+
+    } else {
+
+        checks.push({
+            field:"Vehicle",
+            match: normalizeVehicle(truck.truck_no) === normalizeVehicle(erp.vehicle_no),
+            invoice:truck.truck_no,
+            erp:erp.vehicle_no
+        });
+
+    }
+
+    /***************************************************
+     * RATE + FREIGHT
+     *
+     * Weight-based FO : invoice rate is "x1000" form
+     *                   (e.g. invoice 2250, erp 2.25)
+     * Qty/fixed-rate FO : rate compared directly
+     *                   (e.g. invoice 8800, erp 8800.00)
+     ***************************************************/
+
+    const erpRate = Number(erp.rate);
+    const weightBased = isWeightBasedFO(erp);
+
+    let invoiceRate, expectedFreight;
+
+    if(weightBased){
+
+        invoiceRate = Number(truck.rate) / 1000;
+
+        expectedFreight = round2(
+            erpRate * 1000 * Number(truck.weight_charged)
+        );
+
+    } else {
+
+        // Qty/fixed-rate FO: rate is NOT on the line item, it's the
+        // invoice-level taxable_value (falls back to truck.rate if
+        // taxable_value isn't present for some reason).
+        invoiceRate = Number(
+            invoice.taxable_value ?? truck.rate
+        );
+
+        const erpQty = Number(erp.qty || 1);
+        const invoiceQty = Number(invoice.fo_qty ?? erpQty);
+
+        expectedFreight = round2(erpRate * erpQty);
+
+        if(!isNaN(invoiceQty)){
+            checks.push({
+                field:"Quantity",
+                match: Math.abs(invoiceQty - erpQty) <= 0.0001,
+                invoice:invoiceQty,
+                erp:erpQty
+            });
+        }
+
+    }
+
+    if(isNaN(invoiceRate)){
+        checks.push({
+            field:"Rate",
+            match:false,
+            reason:"Rate Not Found On Invoice",
+            fo_type: weightBased ? "weight_based" : "qty_based",
+            erp:erpRate
+        });
+    } else {
+        checks.push({
+            field:"Rate",
+            match: Math.abs(invoiceRate - erpRate) <= 0.0001,
+            fo_type: weightBased ? "weight_based" : "qty_based",
+            invoice:invoiceRate,
+            erp:erpRate
+        });
+    }
+
+    /*
+     * Freight can show up under different labels depending on how the
+     * transporter bills (net of ST charges vs. gross taxable value),
+     * so we check MULTIPLE candidate values from the invoice and pass
+     * if ANY ONE of them matches the ERP-expected freight.
+     */
+
+    const freightCandidates = [
+        { label:"truck.freight",        value: truck.freight },
+        { label:"bill_freight_val",     value: invoice.bill_freight_val },
+        { label:"taxable_value",        value: invoice.taxable_value }
+    ]
+    .filter(c => c.value !== undefined && c.value !== null && c.value !== "")
+    .map(c => ({ label:c.label, value: round2(c.value) }));
+
+    const freightMatch = freightCandidates.find(
+        c => Math.abs(expectedFreight - c.value) <= 1
+    );
+
+    // Keep invoiceFreight for the passed-row summary: prefer the
+    // matching value, otherwise fall back to truck.freight (or the
+    // first available candidate) for reporting purposes.
+    const invoiceFreight = freightMatch
+        ? freightMatch.value
+        : round2(truck.freight ?? freightCandidates[0]?.value ?? 0);
+
+    checks.push({
+        field:"Freight",
+        match: !!freightMatch,
+        fo_type: weightBased ? "weight_based" : "qty_based",
+        expected:expectedFreight,
+        checked: freightCandidates
+    });
+
+    /***************************************************
+     * RESULT
+     ***************************************************/
+
+    const errors = checks.filter(c => !c.match);
+    const matchSummary = {
+        total: checks.length,
+        matched: checks.length - errors.length,
+        not_matched: errors.length
+    };
+
+    if(errors.length){
+
+        result.failed.push({
+            bill_number:bill,
+            grn_number:erp.grn_number,
+            match_summary: matchSummary,
+            errors
+        });
+
+        result.summary.failed++;
+
+    } else {
+
+        result.passed.push({
+            bill_number:bill,
+            grn_number:erp.grn_number,
+            vehicle:truck.truck_no,
+            lr_no:truck.lr_no,
+            freight:invoiceFreight,
+            match_summary: matchSummary,
+            status:"PASS"
+        });
+
+        result.summary.matched++;
+    }
+}
+
+/*********************************************************************
+ * OVERALL STATUS
+ *********************************************************************/
+
+if(result.failed.length){
+    result.status="FAILED";
+}
+
+/*********************************************************************
+ * RETURN
+ *********************************************************************/
+
+return [
+{
+json:result
+}
+];
+
+
+for now chnage the flow check the  first check the reciver that the reciver belong to the internal - company catagory then assigen this company and catagory and sub catagory also and  main think is the any reciver have belong to the internal company then only mark this company . like expample reciver have 2 recipenet one is the GMD company and another person is the Laser internal then only assigen the company Laser as well the catagory and sub catagory . similearly if the Laser - External and other one is the internal GMD then assigen the GMD and catagory also define by the thouse person or emp catagory and sub catagory . one mails have only one company and catagory not multiple company assigen high prioty is the internal if the internal person not present then fine the extenal one don't check cc and sender. so for now i want to chnage this assigent logic . here is th

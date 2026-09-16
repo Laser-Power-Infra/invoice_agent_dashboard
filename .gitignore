@@ -1,0 +1,53 @@
+# ==========================================
+# INVOICE PROJECT DASHBOARD - GITIGNORE
+# ==========================================
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Production Builds & Temp Directories
+dist/
+**/dist/
+build/
+.cache/
+*.tmp
+*.log
+
+# Sensitive Credentials & Local Environment Files
+.env
+.env.local
+.env.*.local
+*.env
+!*.env.example
+credentials.json
+token.json
+**/credentials.json
+**/token.json
+
+# IDE & OS Generated Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Scratch & Temporary Scripts
+server/find_*.js
+server/test_*.js
+server/inspect_*.js
+scratch/
+
+# ==========================================
+# EXPLICITLY TRACK DOCKER & CONFIG FILES
+# ==========================================
+!docker-compose.yml
+!docker-compose*.yml
+!Dockerfile
+!**/Dockerfile
+!nginx.conf
+!**/nginx.conf
+!.dockerignore
+!**/.dockerignore
+!.env.example

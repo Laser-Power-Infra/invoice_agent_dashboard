@@ -1,0 +1,93 @@
+services:
+  # ---------------------------------------------------
+  # Database Service: MySQL 8.0 with Persistent Storage
+  # ---------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: invoice_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-Minmoy@1234@}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-invoice_db}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-Minmoy@1234@}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - invoice_net
+
+  # ---------------------------------------------------
+  # Backend Service: Node.js Express API (Port 6005)
+  # ---------------------------------------------------
+  backend:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: invoice_backend
+    restart: always
+    env_file:
+      - ./server/.env
+    environment:
+      PORT: 6005
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:-Minmoy@1234@}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-invoice_db}
+    ports:
+      - "6005:6005"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - invoice_net
+
+  # ---------------------------------------------------
+  # Frontend Service: Nginx + Compiled Vite SPA (Port 6004)
+  # ---------------------------------------------------
+  frontend:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: invoice_frontend
+    restart: always
+    ports:
+      - "6004:6004"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - invoice_net
+
+  # ---------------------------------------------------
+  # Ngrok Tunnel Service: Public Tunnel for Port 6005
+  # ---------------------------------------------------
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: invoice_ngrok
+    restart: always
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    command:
+      - "http"
+      - "backend:6005"
+    ports:
+      - "4040:4040"
+    depends_on:
+      - backend
+    networks:
+      - invoice_net
+
+networks:
+  invoice_net:
+    driver: bridge
+
+volumes:
+  mysql_data:
+    driver: local
