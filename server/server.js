@@ -581,7 +581,7 @@ async function fetchFreshData() {
   const timeout = setTimeout(() => controller.abort(), 120000); // 2 minutes timeout for large datasets
 
   try {
-    const response = await fetch(APPS_SCRIPT_URL, { signal: controller.signal });
+    const response = await fetch(APPS_SCRIPT_URL, { signal: controller.signal, redirect: 'follow' });
     clearTimeout(timeout);
 
     if (!response.ok) {
@@ -596,7 +596,10 @@ async function fetchFreshData() {
     }
   } catch (err) {
     clearTimeout(timeout);
-    throw err;
+    const causeMsg = err.cause ? ` (cause: ${err.cause.code || err.cause.message || err.cause})` : '';
+    const enrichedErr = new Error(`${err.message}${causeMsg}`);
+    enrichedErr.cause = err.cause;
+    throw enrichedErr;
   }
 }
 
@@ -675,7 +678,8 @@ app.post('/api/update-record', async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req.body),
-        signal: controller.signal
+        signal: controller.signal,
+        redirect: 'follow'
       });
 
       clearTimeout(timeout);
@@ -687,7 +691,8 @@ app.post('/api/update-record', async (req, res) => {
         }
       }
     } catch (scriptErr) {
-      console.warn('Google Sheets sync warning (MySQL updated cleanly):', scriptErr.message);
+      const causeMsg = scriptErr.cause ? ` (${scriptErr.cause.code || scriptErr.cause.message || scriptErr.cause})` : '';
+      console.warn(`Google Sheets sync warning (MySQL updated cleanly): ${scriptErr.message}${causeMsg}`);
     }
 
     res.json({
@@ -946,7 +951,8 @@ async function deleteRowsFromSheet(sheetName, conditions) {
       headers: {
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ sheet: sheetName, conditions })
+      body: JSON.stringify({ sheet: sheetName, conditions }),
+      redirect: 'follow'
     });
     
     const result = await response.json();
@@ -957,7 +963,8 @@ async function deleteRowsFromSheet(sheetName, conditions) {
     }
     return false;
   } catch (e) {
-    console.error('Delete request error:', e.message);
+    const causeMsg = e.cause ? ` (${e.cause.code || e.cause.message || e.cause})` : '';
+    console.error(`Delete request error: ${e.message}${causeMsg}`);
     return false;
   }
 }
@@ -1102,7 +1109,8 @@ async function warmCacheBackground(force = false) {
     console.log('Successfully synchronized fresh Google Sheets data into MySQL.');
   } catch (err) {
     activeFetchPromise = null;
-    console.warn('Background cache check failed:', err.message);
+    const causeMsg = err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
+    console.warn(`Background cache check failed: ${err.message}${causeMsg}`);
   }
 }
 

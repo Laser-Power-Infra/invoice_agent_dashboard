@@ -47,6 +47,9 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-invoice_db}
     ports:
       - "6005:6005"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     networks:
       - invoice_net
       - infra
