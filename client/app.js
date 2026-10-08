@@ -318,9 +318,10 @@ async function fetchAndRefresh(forceRefresh = false) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout for large fetches
 
-    let url = forceRefresh 
-      ? `${SERVER_BASE_URL}/api/data?refresh=true&_=${Date.now()}`
-      : `${SERVER_BASE_URL}/api/data`;
+    let url = `${SERVER_BASE_URL}/api/data?_=${Date.now()}`;
+    if (forceRefresh) {
+      url += '&refresh=true';
+    }
 
     const response = await safeFetch(url, { signal: controller.signal });
     clearTimeout(timeoutId);
@@ -346,6 +347,9 @@ async function fetchAndRefresh(forceRefresh = false) {
 
       // Re-render all views with fresh data
       renderAllViews();
+
+      // Repair stale array JSON columns in the background (rate-limited, once per record)
+      scheduleSelfHeal();
     } else {
       throw new Error('Server returned unsuccessful payload');
     }
@@ -451,17 +455,11 @@ function saveToLocalStorage() {
     localStorage.setItem('db_dashboard_stats', JSON.stringify(state.dashboardStats));
     localStorage.setItem('db_uploaded_pdfs', JSON.stringify(state.uploadedPdfs.slice(0, 30)));
 
-    const lightInvoices = state.invoices.slice(0, 100).map(inv => {
-      const copy = { ...inv };
-      delete copy._rawArray;
-      delete copy.line_items;
-      return copy;
-    });
-    const lightPurchases = state.purchases.slice(0, 100).map(pur => {
-      const copy = { ...pur };
-      delete copy._rawArray;
-      return copy;
-    });
+    const lightInvoices = state.invoices.slice(0, 100).map(inv => ({
+      ...inv,
+      line_items: []
+    }));
+    const lightPurchases = state.purchases.slice(0, 100);
 
     localStorage.setItem('db_invoices', JSON.stringify(lightInvoices));
     localStorage.setItem('db_purchases', JSON.stringify(lightPurchases));
@@ -717,20 +715,11 @@ function processRawData(data) {
     let parsedArray = {};
     try {
       if (inv.array) {
-        parsedArray = typeof inv.array === 'string' ? JSON.parse(inv.array) : inv.array;
-        while (parsedArray && typeof parsedArray.array === 'string' && parsedArray.array.trim().startsWith('{')) {
-          try {
-            const inner = JSON.parse(parsedArray.array);
-            parsedArray = { ...inner, ...parsedArray };
-          } catch (_) { break; }
-        }
+        parsedArray = JSON.parse(inv.array);
       }
     } catch (e) {
       console.warn("Failed to parse stringified invoice details: ", e);
     }
-
-    const acct = parsedArray.accounting_entity_fields || {};
-    const complex = parsedArray.complex_logic_fields || {};
 
     const invoiceNumber = parsedArray.invoice_number || inv.invoice_number || inv.party_inv_no || inv.our_bill_no || '';
     // Debug: log raw server data for BS260000786
@@ -743,14 +732,14 @@ function processRawData(data) {
     const rawInvoiceDateStr = parsedArray.invoice_date || parsedArray.party_inv_date || inv.invoice_date || inv.party_inv_date || '';
     const invoiceDate = normalizeToISODate(rawInvoiceDateStr);
     const partyName = inv.party_name || parsedArray.party_name || parsedArray.transporter_name || '';
-    const billFreightVal = parseNumericValue(inv.bill_freight_val ?? parsedArray.bill_freight_val ?? complex.bill_freight_val ?? 0);
-    const netPayable = parseNumericValue(inv.net_payable ?? parsedArray.net_payable ?? complex.net_payable ?? inv.final_val_after_deduction ?? parsedArray.final_val_after_deduction ?? 0);
-    const totalInvoiceVal = parseNumericValue(inv.total_invoice_value ?? parsedArray.total_invoice_value ?? complex.total_invoice_value ?? inv.net_payable ?? parsedArray.net_payable ?? 0);
-    let rcmValue = parsePercentValue(inv.RCM ?? inv.rcm ?? parsedArray.RCM ?? parsedArray.rcm ?? complex.RCM ?? complex.rcm ?? 0);
-    const stCharges = parseNumericValue(inv.st_charges ?? inv.total_st_charges ?? parsedArray.st_charges ?? complex.st_charges ?? parsedArray.total_st_charges ?? 0);
-    let cgstAmount = parseNumericValue(inv.cgst ?? parsedArray.cgst_amount ?? parsedArray.cgst ?? complex.cgst_amount ?? complex.cgst ?? 0);
-    let sgstAmount = parseNumericValue(inv.sgst ?? parsedArray.sgst_amount ?? parsedArray.sgst ?? complex.sgst_amount ?? complex.sgst ?? 0);
-    let igstAmount = parseNumericValue(inv.igst ?? parsedArray.igst_amount ?? parsedArray.igst ?? complex.igst_amount ?? complex.igst ?? 0);
+    const billFreightVal = parseNumericValue(inv.bill_freight_val ?? parsedArray.bill_freight_val ?? 0);
+    const netPayable = parseNumericValue(inv.net_payable ?? parsedArray.net_payable ?? inv.final_val_after_deduction ?? parsedArray.final_val_after_deduction ?? 0);
+    const totalInvoiceVal = parseNumericValue(inv.total_invoice_value ?? parsedArray.total_invoice_value ?? inv.net_payable ?? parsedArray.net_payable ?? 0);
+    let rcmValue = parsePercentValue(inv.RCM ?? inv.rcm ?? parsedArray.RCM ?? parsedArray.rcm ?? 0);
+    const stCharges = parseNumericValue(inv.st_charges ?? inv.total_st_charges ?? parsedArray.st_charges ?? parsedArray.total_st_charges ?? 0);
+    let cgstAmount = parseNumericValue(inv.cgst ?? parsedArray.cgst_amount ?? parsedArray.cgst ?? 0);
+    let sgstAmount = parseNumericValue(inv.sgst ?? parsedArray.sgst_amount ?? parsedArray.sgst ?? 0);
+    let igstAmount = parseNumericValue(inv.igst ?? parsedArray.igst_amount ?? parsedArray.igst ?? 0);
 
     const totalGst = cgstAmount + sgstAmount + igstAmount;
     const gstRate = billFreightVal > 0 ? (totalGst / billFreightVal) : 0;
@@ -787,12 +776,12 @@ function processRawData(data) {
       invoice_number: invoiceNumber,
       invoice_date: invoiceDate,
       party_name: partyName,
-      party_code: inv.party_code || parsedArray.party_code || acct.party_code || '',
-      party_slno: inv.party_slno || parsedArray.party_slno || acct.party_slno || '',
-      party_reg_addr: inv.party_reg_addr || parsedArray.party_reg_addr || acct.party_reg_addr || '',
-      our_slno: inv.our_slno || parsedArray.our_slno || acct.our_slno || '',
-      our_reg_addr: inv.our_reg_addr || parsedArray.our_reg_addr || acct.our_reg_addr || '',
-      buyer_name: inv.buyer_name || parsedArray.buyer_name || acct.party_name || '',
+      party_code: inv.party_code || parsedArray.party_code || '',
+      party_slno: inv.party_slno || parsedArray.party_slno || '',
+      party_reg_addr: inv.party_reg_addr || parsedArray.party_reg_addr || '',
+      our_slno: inv.our_slno || parsedArray.our_slno || '',
+      our_reg_addr: inv.our_reg_addr || parsedArray.our_reg_addr || '',
+      buyer_name: inv.buyer_name || parsedArray.buyer_name || '',
       transporter_name: inv.transporter_name || parsedArray.transporter_name || '',
       transporter_gstin: inv.transporter_gstin || parsedArray.transporter_gstin || '',
       to_place_name: inv.to_place_name || parsedArray.to_place_name || '',
@@ -807,29 +796,28 @@ function processRawData(data) {
       cgst: cgstAmount,
       sgst: sgstAmount,
       igst: igstAmount,
-      fo_no: extractFirstString(inv.fo_no || parsedArray.fo_no || parsedArray.fo_order_number || acct.fo_no || ''),
+      fo_no: extractFirstString(inv.fo_no || parsedArray.fo_no || parsedArray.fo_order_number || ''),
       fo_rate: rawFoRate,
       fo_qty: rawFoQty,
       fo_order_value: rawFoOrderVal,
       our_bill_no: inv.our_bill_no || parsedArray.our_invoice_number || '',
       cn_lr_no: inv.cn_lr_no || parsedArray.cn_lr_no || '',
       lr_date: lrDate,
-      expense_acc_code: inv.expense_acc_code || parsedArray.expense_acc_code || complex.expense_acc_code || '',
-      expense_acc_name: inv.expense_acc_name || parsedArray.expense_acc_name || complex.expense_acc_name || '',
-      sub_acc_code: inv.sub_acc_code || parsedArray.sub_acc_code || complex.sub_acc_code || '',
-      sub_acc_name: inv.sub_acc_name || parsedArray.sub_acc_name || complex.sub_acc_name || '',
-      service_acc_code: inv.service_acc_code || parsedArray.service_acc_code || parsedArray.Service_acc_code || inv.Service_acc_code || complex.service_acc_code || '',
-      service_acc_name: inv.service_acc_name || parsedArray.service_acc_name || complex.service_acc_name || '',
-      sac_code: inv.sac_code || parsedArray.sac_code || complex.sac_code || '',
-      series: inv.series || parsedArray.series || complex.series || '',
-      div_code: inv.div_code || parsedArray.div_code || complex.div_code || '',
-      addon_code_str: (inv.addon_code_str && inv.addon_code_str.trim()) || (parsedArray.addon_code_str && parsedArray.addon_code_str.trim()) || complex.addon_code_str || '',
-      stax_code_str: inv.stax_code_str || parsedArray.stax_code_str || complex.stax_code_str || '',
-      tnature: inv.tnature || parsedArray.tnature || complex.tnature || '',
+      expense_acc_code: inv.expense_acc_code || parsedArray.expense_acc_code || '',
+      expense_acc_name: inv.expense_acc_name || parsedArray.expense_acc_name || '',
+      sub_acc_code: inv.sub_acc_code || parsedArray.sub_acc_code || '',
+      sub_acc_name: inv.sub_acc_name || parsedArray.sub_acc_name || '',
+      service_acc_code: inv.service_acc_code || parsedArray.service_acc_code || parsedArray.Service_acc_code || inv.Service_acc_code || '',
+      service_acc_name: inv.service_acc_name || parsedArray.service_acc_name || '',
+      sac_code: inv.sac_code || parsedArray.sac_code || '',
+      series: inv.series || parsedArray.series || '',
+      div_code: inv.div_code || parsedArray.div_code || '',
+      addon_code_str: inv.addon_code_str || parsedArray.addon_code_str || '',
+      stax_code_str: inv.stax_code_str || parsedArray.stax_code_str || '',
       line_items: parsedArray.line_items || [],
       pdf_url: extractPdfUrl(inv) || extractPdfUrl(parsedArray),
       total_invoice_value: totalInvoiceVal,
-      tax_critaria: inv.tax_critaria || inv.tax_criteria || complex.tax_critaria || '',
+      tax_critaria: inv.tax_critaria || inv.tax_criteria || '',
       project: inv.project || '',
       project_code: inv.project_code || '',
       deparment: inv.deparment || inv.department || '',
@@ -854,29 +842,20 @@ function processRawData(data) {
     let parsedArray = {};
     try {
       if (pur.array) {
-        parsedArray = typeof pur.array === 'string' ? JSON.parse(pur.array) : pur.array;
-        while (parsedArray && typeof parsedArray.array === 'string' && parsedArray.array.trim().startsWith('{')) {
-          try {
-            const inner = JSON.parse(parsedArray.array);
-            parsedArray = { ...inner, ...parsedArray };
-          } catch (_) { break; }
-        }
+        parsedArray = JSON.parse(pur.array);
       }
     } catch (e) {}
 
-    const purAcct = parsedArray.accounting_entity_fields || {};
-    const purComplex = parsedArray.complex_logic_fields || {};
-
-    const tdsPercent = parsePercentValue(pur.tds_percent ?? parsedArray.tds_percent ?? purComplex.tds_percent ?? 0);
-    const billFreightVal = parseNumericValue(pur.bill_freight_val ?? purComplex.bill_freight_val ?? 0);
-    const taxableValue = parseNumericValue(pur.taxable_value ?? purComplex.taxable_value ?? 0);
-    const netPayable = parseNumericValue(pur.net_payable ?? purComplex.net_payable ?? taxableValue ?? 0);
-    let rcmValue = parsePercentValue(pur.rcm ?? pur.RCM ?? purComplex.RCM ?? purComplex.rcm ?? 0);
+    const tdsPercent = parsePercentValue(pur.tds_percent ?? parsedArray.tds_percent ?? 0);
+    const billFreightVal = parseNumericValue(pur.bill_freight_val ?? 0);
+    const taxableValue = parseNumericValue(pur.taxable_value ?? 0);
+    const netPayable = parseNumericValue(pur.net_payable ?? taxableValue ?? 0);
+    let rcmValue = parsePercentValue(pur.rcm ?? pur.RCM ?? 0);
     const partyInvNo = String(pur.party_inv_no || parsedArray.invoice_number || parsedArray.party_inv_no || '');
 
-    let cgstAmount = parseNumericValue(pur.cgst ?? purComplex.cgst_amount ?? purComplex.cgst ?? 0);
-    let sgstAmount = parseNumericValue(pur.sgst ?? purComplex.sgst_amount ?? purComplex.sgst ?? 0);
-    let igstAmount = parseNumericValue(pur.igst ?? purComplex.igst_amount ?? purComplex.igst ?? 0);
+    let cgstAmount = parseNumericValue(pur.cgst ?? 0);
+    let sgstAmount = parseNumericValue(pur.sgst ?? 0);
+    let igstAmount = parseNumericValue(pur.igst ?? 0);
     const totalGst = cgstAmount + sgstAmount + igstAmount + parseNumericValue(pur.total_gst_value ?? 0);
     const gstRate = billFreightVal > 0 ? (totalGst / billFreightVal) : 0;
 
@@ -897,7 +876,7 @@ function processRawData(data) {
       rawPurFoRate = Number((rawPurFoOrderVal / rawPurFoQty).toFixed(4));
     }
 
-    const stCharges = parseNumericValue(pur.st_charges ?? pur.total_st_charges ?? parsedArray.st_charges ?? purComplex.st_charges ?? parsedArray.total_st_charges ?? 0);
+    const stCharges = parseNumericValue(pur.st_charges ?? pur.total_st_charges ?? parsedArray.st_charges ?? parsedArray.total_st_charges ?? 0);
 
     return {
       id: `pur-${(partyInvNo || idx).toString().replace(/[^a-zA-Z0-9]/g, '_')}-${idx}`,
@@ -919,24 +898,24 @@ function processRawData(data) {
         
         return normalizeToISODate(pDate);
       })(),
-      party_name: pur.party_name || parsedArray.transporter_name || parsedArray.buyer_name || purAcct.party_name || '',
-      party_code: pur.party_code || purAcct.party_code || '',
-      party_slno: pur.party_slno || purAcct.party_slno || '',
-      party_reg_addr: pur.party_reg_addr || purAcct.party_reg_addr || '',
-      our_slno: pur.our_slno || purAcct.our_slno || '',
-      our_reg_addr: pur.our_reg_addr || purAcct.our_reg_addr || '',
-      tnature: pur.tnature || purComplex.tnature || '',
-      expense_acc_code: pur.expense_acc_code || purComplex.expense_acc_code || '',
-      expense_acc_name: pur.expense_acc_name || purComplex.expense_acc_name || '',
-      sub_acc_code: pur.sub_acc_code || purComplex.sub_acc_code || '',
-      sub_acc_name: pur.sub_acc_name || purComplex.sub_acc_name || '',
-      service_acc_code: pur.service_acc_code || purComplex.service_acc_code || '',
-      service_acc_name: pur.service_acc_name || purComplex.service_acc_name || '',
-      sac_code: pur.sac_code || purComplex.sac_code || '',
-      series: pur.series || purComplex.series || '',
-      div_code: pur.div_code || purComplex.div_code || '',
-      addon_code_str: (pur.addon_code_str && pur.addon_code_str.trim()) || purComplex.addon_code_str || '',
-      stax_code_str: pur.stax_code_str || purComplex.stax_code_str || '',
+      party_name: pur.party_name || parsedArray.transporter_name || parsedArray.buyer_name || '',
+      party_code: pur.party_code || '',
+      party_slno: pur.party_slno || '',
+      party_reg_addr: pur.party_reg_addr || '',
+      our_slno: pur.our_slno || '',
+      our_reg_addr: pur.our_reg_addr || '',
+      tnature: pur.tnature || '',
+      expense_acc_code: pur.expense_acc_code || '',
+      expense_acc_name: pur.expense_acc_name || '',
+      sub_acc_code: pur.sub_acc_code || '',
+      sub_acc_name: pur.sub_acc_name || '',
+      service_acc_code: pur.service_acc_code || '',
+      service_acc_name: pur.service_acc_name || '',
+      sac_code: pur.sac_code || '',
+      series: pur.series || '',
+      div_code: pur.div_code || '',
+      addon_code_str: pur.addon_code_str || '',
+      stax_code_str: pur.stax_code_str || '',
       bill_freight_val: billFreightVal,
       st_charges: stCharges,
       taxable_value: taxableValue,
@@ -3617,20 +3596,11 @@ function openDetailedRecordModal(target) {
   statusBadge.textContent = statusText;
   statusBadge.className = badgeClass;
 
-  // Group all matching records for this invoice number
-  const cleanInvNo = String(invoiceNumber || '').trim().toLowerCase();
-  const groupInvoices = invoice 
-    ? state.invoices.filter(i => String(i.invoice_number).trim().toLowerCase() === cleanInvNo)
-    : [];
-  const groupPurchases = purchase 
-    ? state.purchases.filter(p => String(p.party_inv_no).trim().toLowerCase() === cleanInvNo)
-    : [];
-
   // Build Invoice Details Side
-  buildInvoiceDetailsView(invoice, groupInvoices.length > 0 ? groupInvoices : (invoice ? [invoice] : []));
+  buildInvoiceDetailsView(invoice, invoice ? [invoice] : []);
 
   // Build Purchase Details Side
-  buildPurchaseDetailsView(purchase, groupPurchases.length > 0 ? groupPurchases : (purchase ? [purchase] : []));
+  buildPurchaseDetailsView(purchase, purchase ? [purchase] : []);
 
   // Toggle buttons
   toggleEditMode(false);
@@ -4389,15 +4359,10 @@ function buildPurchaseDetailsView(purchase, groupRecords) {
     return matchByInvNo || matchByOurBill;
   });
 
-  const coalesceField = (key) => {
-    const pVal = purchase[key];
-    if (pVal !== null && pVal !== undefined && String(pVal).trim() !== '' && pVal !== '-') return String(pVal).trim();
-    const matchPurVal = allMatchedPurchases.map(p => p[key]).find(v => v !== null && v !== undefined && String(v).trim() !== '' && v !== '-');
-    if (matchPurVal) return String(matchPurVal).trim();
-    const matchInvVal = matchingInv ? matchingInv[key] : null;
-    if (matchInvVal !== null && matchInvVal !== undefined && String(matchInvVal).trim() !== '' && matchInvVal !== '-') return String(matchInvVal).trim();
-    return '';
-  };
+  const coalesceField = (key) =>
+    purchase[key] ||
+    allMatchedPurchases.map(p => p[key]).find(v => v && String(v).trim() !== '' && v !== '-') ||
+    '';
 
   const coalescedProject      = coalesceField('project');
   const coalescedProjectCode  = coalesceField('project_code');
@@ -4405,7 +4370,6 @@ function buildPurchaseDetailsView(purchase, groupRecords) {
   const coalescedDepermentCode = coalesceField('deperment_code');
   const coalescedTaxCritaria  = coalesceField('tax_critaria');
   const coalescedTaxCritariaName = coalesceField('tax_critaria_name');
-  const coalescedTnature      = coalesceField('tnature');
   const coalescedServiceAccName = coalesceField('service_acc_name');
   const coalescedServiceAccCode = coalesceField('service_acc_code');
   const coalescedExpenseAccName = coalesceField('expense_acc_name');
@@ -4428,7 +4392,7 @@ function buildPurchaseDetailsView(purchase, groupRecords) {
     { label: "FO Order Value (₹)", key: "fo_order_value", value: foOrderValue, type: "number" },
     { label: "Supplier Party", key: "party_name", value: purchase.party_name, type: "text" },
     { label: "Our Registration Address", key: "our_reg_addr", value: coalescedOurRegAddr, type: "text" },
-    { label: "Tnature", key: "tnature", value: coalescedTnature, type: "text" },
+    { label: "Tnature", key: "expense_acc_name", value: coalescedExpenseAccName, type: "text" },
     { label: "Expense Account Code", key: "expense_acc_code", value: coalescedExpenseAccCode, type: "text" },
     { label: "Sub Ledger Account", key: "sub_acc_name", value: coalescedSubAccName, type: "text" },
     { label: "Sub Account Code", key: "sub_acc_code", value: coalescedSubAccCode, type: "text" },

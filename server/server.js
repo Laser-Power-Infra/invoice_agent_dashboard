@@ -398,37 +398,9 @@ async function syncSheetsToMySQL(fullData) {
   }
 }
 
-function flattenAndCleanArray(raw) {
-  if (!raw) return {};
-  let curr = raw;
-  let merged = {};
-  while (curr && (typeof curr === 'string' || typeof curr === 'object')) {
-    let parsed = curr;
-    if (typeof curr === 'string') {
-      try {
-        parsed = JSON.parse(curr);
-      } catch (e) {
-        break;
-      }
-    }
-    if (parsed && typeof parsed === 'object') {
-      const next = parsed.array;
-      const copy = { ...parsed };
-      delete copy.array;
-      merged = { ...copy, ...merged };
-      curr = next;
-    } else {
-      break;
-    }
-  }
-  delete merged.array;
-  return merged;
-}
-
 let localDbMemoryCache = null;
 let localDbMemoryCacheTime = 0;
-let activeDbReadPromise = null;
-const CACHE_TTL_MYSQL = 120000; // 2 minutes TTL (single-row updates patch in-place)
+const CACHE_TTL_MYSQL = 60000; // 60 seconds TTL (single-row updates patch in-place)
 
 async function loadDataFromMySQL() {
   const now = Date.now();
@@ -436,60 +408,47 @@ async function loadDataFromMySQL() {
     return localDbMemoryCache;
   }
 
-  if (activeDbReadPromise) {
-    return activeDbReadPromise;
-  }
-
-  activeDbReadPromise = (async () => {
-    let conn;
-    const start = Date.now();
-    try {
-      conn = await getDBConnection();
-      const [tables] = await conn.query('SHOW TABLES');
-      const tableNames = tables.map(t => Object.values(t)[0].toLowerCase());
-      
-      let invoices = [];
-      if (tableNames.includes('item details')) {
-        const [rows] = await conn.query('SELECT * FROM `Item Details`');
-        invoices = cleanMySQLRows(rows);
-      }
-      
-      let purchases = [];
-      if (tableNames.includes('invoice details')) {
-        const [rows] = await conn.query('SELECT * FROM `Invoice Details`');
-        purchases = cleanMySQLRows(rows);
-      }
-      
-      dbTracker.record('SELECT_ALL_TABLES', Date.now() - start);
-
-      localDbMemoryCache = {
-        success: true,
-        invoices,
-        purchases
-      };
-      localDbMemoryCacheTime = Date.now();
-
-      return localDbMemoryCache;
-    } catch (err) {
-      console.error('Error reading from MySQL:', err.message);
-      throw err;
-    } finally {
-      activeDbReadPromise = null;
-      if (conn) conn.release();
+  let conn;
+  const start = Date.now();
+  try {
+    conn = await getDBConnection();
+    const [tables] = await conn.query('SHOW TABLES');
+    const tableNames = tables.map(t => Object.values(t)[0].toLowerCase());
+    
+    let invoices = [];
+    if (tableNames.includes('item details')) {
+      const [rows] = await conn.query('SELECT * FROM `Item Details`');
+      invoices = cleanMySQLRows(rows);
     }
-  })();
+    
+    let purchases = [];
+    if (tableNames.includes('invoice details')) {
+      const [rows] = await conn.query('SELECT * FROM `Invoice Details`');
+      purchases = cleanMySQLRows(rows);
+    }
+    
+    dbTracker.record('SELECT_ALL_TABLES', Date.now() - start);
 
-  return activeDbReadPromise;
+    localDbMemoryCache = {
+      success: true,
+      invoices,
+      purchases
+    };
+    localDbMemoryCacheTime = now;
+
+    return localDbMemoryCache;
+  } catch (err) {
+    console.error('Error reading from MySQL:', err.message);
+    throw err;
+  } finally {
+    if (conn) conn.release();
+  }
 }
 
 function cleanMySQLRows(rows) {
   return rows.map(row => {
     const cleaned = { ...row };
     delete cleaned.id;
-    if (cleaned.array && typeof cleaned.array === 'string' && cleaned.array.includes('"array":')) {
-      const flat = flattenAndCleanArray(cleaned.array);
-      cleaned.array = JSON.stringify(flat);
-    }
     return cleaned;
   });
 }
@@ -514,7 +473,7 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
     const searchColField = cols.find(c => c.Field.toLowerCase() === searchColumn.toLowerCase())?.Field || searchColumn;
     const cleanSearchVal = String(searchValue).trim();
 
-    // Sync array JSON field in MySQL if present (guaranteed flat, never recursively nested)
+    // Sync array JSON field in MySQL if present
     const hasArrayCol = cols.some(c => c.Field.toLowerCase() === 'array');
     if (hasArrayCol) {
       try {
@@ -523,22 +482,13 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
           [cleanSearchVal]
         );
         dbTracker.record('SELECT_SINGLE_ROW', 1);
-
-        let existingObj = {};
         if (existingRows && existingRows.length > 0 && existingRows[0].array) {
-          existingObj = flattenAndCleanArray(existingRows[0].array);
+          const arrObj = JSON.parse(existingRows[0].array);
+          Object.assign(arrObj, updates);
+          validUpdates['array'] = JSON.stringify(arrObj);
+        } else if (validUpdates['array']) {
+          // If array string was passed in payload, use it directly
         }
-
-        let incomingUpdates = { ...updates };
-        if (incomingUpdates.array) {
-          const unpackedIncoming = flattenAndCleanArray(incomingUpdates.array);
-          delete incomingUpdates.array;
-          incomingUpdates = { ...unpackedIncoming, ...incomingUpdates };
-        }
-
-        const mergedObj = { ...existingObj, ...incomingUpdates };
-        delete mergedObj.array; // NEVER allow recursive array nesting!
-        validUpdates['array'] = JSON.stringify(mergedObj);
       } catch (e) {
         console.warn('Could not update array JSON column in MySQL:', e.message);
       }
@@ -657,7 +607,6 @@ async function fetchFreshData() {
 app.get('/api/data', async (req, res) => {
   try {
     const forceRefresh = req.query.refresh === 'true' || req.query.forceRefresh === 'true';
-    res.setHeader('Cache-Control', forceRefresh ? 'no-cache' : 'public, max-age=30');
     
     // Serve from MySQL database if not forcing a refresh
     if (!forceRefresh) {
