@@ -937,7 +937,8 @@ function processRawData(data) {
       lorry_vehicle_no: extractFirstString(pur.lorry_vehicle_no || pur.truck_no || parsedArray.truck_no || parsedArray.lorry_vehicle_no || ''),
       cn_lr_no: extractFirstString(pur.cn_lr_no || pur.lr_no || parsedArray.lr_no || parsedArray.cn_lr_no || ''),
       description: extractFirstString(pur.description || pur.item_name || parsedArray.item_name || parsedArray.description || ''),
-      present_our_invoice: pur.present_our_invoice || '',
+      our_bill_no: pur.our_bill_no || pur.present_our_invoice || pur.our_invoice_number || parsedArray.our_invoice_number || '',
+      present_our_invoice: pur.present_our_invoice || pur.our_bill_no || pur.our_invoice_number || parsedArray.our_invoice_number || '',
       tax_critaria: pur.tax_critaria || pur.tax_criteria || '',
       tax_critaria_name: pur.tax_critaria_name || pur.tax_criteria_name || '',
       project: pur.project || '',
@@ -2133,12 +2134,19 @@ function generateMergedERPRows(invoiceNumber) {
     if (pur && pur.our_bill_no && String(pur.our_bill_no).trim() !== '') {
       return String(pur.our_bill_no).trim();
     }
+    if (pur && pur.present_our_invoice && String(pur.present_our_invoice).trim() !== '') {
+      return String(pur.present_our_invoice).trim();
+    }
+    const lineItemOurNo = inv?.line_items?.map(li => li.our_invoice_number).find(v => v && String(v).trim() !== '');
+    if (lineItemOurNo) return String(lineItemOurNo).trim();
     const aiSummaryText = (pur && pur.ai_summary) || (inv && inv.ai_summary) || '';
     if (aiSummaryText) {
       const match = aiSummaryText.match(/([A-Z0-9a-z-]+)\s+Validated/);
       if (match) return match[1];
       const matchLP = aiSummaryText.match(/(LP[A-Za-z0-9-]+)/);
       if (matchLP) return matchLP[1];
+      const matchBS = aiSummaryText.match(/(BS[0-9]{5,})/i);
+      if (matchBS) return matchBS[1];
     }
     return '-';
   })();
@@ -2150,13 +2158,13 @@ function generateMergedERPRows(invoiceNumber) {
     if (r.line_items && r.line_items.length > 0) {
       const itemsWithInvoiceNumber = r.line_items.map(item => ({
         ...item,
-        our_invoice_number: item.our_invoice_number || r.invoice_number || r.party_inv_no || r.our_bill_no || ''
+        our_invoice_number: item.our_invoice_number || r.our_bill_no || r.present_our_invoice || (ourInvoiceNo !== '-' ? ourInvoiceNo : '')
       }));
       lineItems = [...lineItems, ...itemsWithInvoiceNumber];
     } else {
       lineItems.push({
         date: r.lr_date || r.invoice_date || r.party_inv_date,
-        our_invoice_number: r.invoice_number || r.party_inv_no || r.our_bill_no || '',
+        our_invoice_number: r.our_bill_no || r.present_our_invoice || (ourInvoiceNo !== '-' ? ourInvoiceNo : ''),
         truck_no: r.lorry_vehicle_no,
         fo_no: r.fo_no,
         description: r.item_name || r.description,
@@ -2169,7 +2177,7 @@ function generateMergedERPRows(invoiceNumber) {
   if (lineItems.length === 0 && pur) {
     lineItems.push({
       date: pur.party_inv_date,
-      our_invoice_number: pur.party_inv_no || '',
+      our_invoice_number: pur.present_our_invoice || pur.our_bill_no || (ourInvoiceNo !== '-' ? ourInvoiceNo : ''),
       truck_no: pur.lorry_vehicle_no || '-',
       fo_no: pur.fo_no || '-',
       description: pur.description || pur.expense_acc_name || '-',
@@ -3629,30 +3637,37 @@ function buildERPRowsView(invoice, purchase) {
     if (pur && pur.our_bill_no && String(pur.our_bill_no).trim() !== '') {
       return String(pur.our_bill_no).trim();
     }
+    if (pur && pur.present_our_invoice && String(pur.present_our_invoice).trim() !== '') {
+      return String(pur.present_our_invoice).trim();
+    }
+    const lineItemOurNo = inv?.line_items?.map(li => li.our_invoice_number).find(v => v && String(v).trim() !== '');
+    if (lineItemOurNo) return String(lineItemOurNo).trim();
     const aiSummaryText = (pur && pur.ai_summary) || (inv && inv.ai_summary) || '';
     if (aiSummaryText) {
       const match = aiSummaryText.match(/([A-Z0-9a-z-]+)\s+Validated/);
       if (match) return match[1];
       const matchLP = aiSummaryText.match(/(LP[A-Za-z0-9-]+)/);
       if (matchLP) return matchLP[1];
+      const matchBS = aiSummaryText.match(/(BS[0-9]{5,})/i);
+      if (matchBS) return matchBS[1];
     }
     return '-';
   })();
 
   // Aggregate multiple values from line items / shipments if present
   let lineItems = [];
-  const groupRecords = inv.id ? [inv] : [];
+  const groupRecords = inv && inv.id ? [inv] : [];
   groupRecords.forEach(r => {
     if (r.line_items && r.line_items.length > 0) {
       const itemsWithInvoiceNumber = r.line_items.map(item => ({
         ...item,
-        our_invoice_number: item.our_invoice_number || r.invoice_number || r.party_inv_no || r.our_bill_no || ''
+        our_invoice_number: item.our_invoice_number || r.our_bill_no || r.present_our_invoice || (ourInvoiceNo !== '-' ? ourInvoiceNo : '')
       }));
       lineItems = [...lineItems, ...itemsWithInvoiceNumber];
     } else {
       lineItems.push({
         date: r.lr_date || r.invoice_date,
-        our_invoice_number: r.invoice_number || r.party_inv_no || r.our_bill_no || '',
+        our_invoice_number: r.our_bill_no || r.present_our_invoice || (ourInvoiceNo !== '-' ? ourInvoiceNo : ''),
         truck_no: r.lorry_vehicle_no,
         fo_no: r.fo_no,
         description: r.item_name || r.description,
@@ -3673,7 +3688,7 @@ function buildERPRowsView(invoice, purchase) {
     if (purMatch) {
       lineItems.push({
         date: purMatch.party_inv_date,
-        our_invoice_number: purMatch.party_inv_no || '',
+        our_invoice_number: purMatch.present_our_invoice || purMatch.our_bill_no || (ourInvoiceNo !== '-' ? ourInvoiceNo : ''),
         truck_no: purMatch.lorry_vehicle_no || '-',
         fo_no: purMatch.fo_no || '-',
         description: purMatch.description || purMatch.expense_acc_name || '-',
@@ -4091,14 +4106,14 @@ function buildInvoiceDetailsView(invoice, groupRecords) {
     if (r.line_items && r.line_items.length > 0) {
       const itemsWithInvoiceNumber = r.line_items.map(item => ({
         ...item,
-        our_invoice_number: item.our_invoice_number || r.our_bill_no || r.invoice_number || r.party_inv_no || ''
+        our_invoice_number: item.our_invoice_number || r.our_bill_no || r.present_our_invoice || ''
       }));
       lineItems = [...lineItems, ...itemsWithInvoiceNumber];
     } else {
       // Fallback row constructed from shipment records top level details
       lineItems.push({
         date: r.lr_date || r.invoice_date,
-        our_invoice_number: r.our_bill_no || r.invoice_number || r.party_inv_no || '',
+        our_invoice_number: r.our_bill_no || r.present_our_invoice || '',
         truck_no: r.lorry_vehicle_no,
         fo_no: r.fo_no,
         description: r.item_name || r.description,
@@ -4120,7 +4135,7 @@ function buildInvoiceDetailsView(invoice, groupRecords) {
     if (purMatch) {
       lineItems.push({
         date: purMatch.party_inv_date,
-        our_invoice_number: purMatch.party_inv_no || '',
+        our_invoice_number: purMatch.present_our_invoice || purMatch.our_bill_no || '',
         truck_no: purMatch.lorry_vehicle_no || '-',
         fo_no: purMatch.fo_no || '-',
         description: purMatch.description || purMatch.expense_acc_name || '-',
@@ -4156,7 +4171,7 @@ function buildInvoiceDetailsView(invoice, groupRecords) {
 
       tr.innerHTML = `
         <td ${isEditable ? `class="editable-cell" data-type="line_item" data-invoice-id="${invoiceIdAttr}" data-line-index="${lineIndex}" data-field="date" title="Double click to edit"` : ''}>${formatDateToDDMMYYYY(item.date || invoice?.lr_date)}</td>
-        <td ${isEditable ? `class="editable-cell" data-type="line_item" data-invoice-id="${invoiceIdAttr}" data-line-index="${lineIndex}" data-field="our_invoice_number" title="Double click to edit"` : ''}><span class="badge badge-purple" style="font-family: monospace; font-size: 0.75rem;">${escapeHtml(item.our_invoice_number || invoice?.invoice_number || invoice?.party_inv_no || invoice?.our_bill_no || '-')}</span></td>
+        <td ${isEditable ? `class="editable-cell" data-type="line_item" data-invoice-id="${invoiceIdAttr}" data-line-index="${lineIndex}" data-field="our_invoice_number" title="Double click to edit"` : ''}><span class="badge badge-purple" style="font-family: monospace; font-size: 0.75rem;">${escapeHtml(item.our_invoice_number || invoice?.our_bill_no || invoice?.present_our_invoice || '-')}</span></td>
         <td ${isEditable ? `class="editable-cell" data-type="line_item" data-invoice-id="${invoiceIdAttr}" data-line-index="${lineIndex}" data-field="truck_no" title="Double click to edit"` : ''}><strong>${escapeHtml(item.truck_no || invoice?.lorry_vehicle_no || '-')}</strong></td>
         <td ${isEditable ? `class="editable-cell" data-type="line_item" data-invoice-id="${invoiceIdAttr}" data-line-index="${lineIndex}" data-field="fo_no" title="Double click to edit"` : ''}>${(!item.fo_no || item.fo_no === '-') ? '<span style="color: var(--accent-red); font-weight: 600;" title="FO Number not tracked - Please re-upload document">- (Re-upload)</span>' : escapeHtml(item.fo_no)}</td>
         <td ${isEditable ? `class="editable-cell" data-type="line_item" data-invoice-id="${invoiceIdAttr}" data-line-index="${lineIndex}" data-field="description" title="Double click to edit"` : ''}>${escapeHtml(item.description || '-')}</td>
