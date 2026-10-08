@@ -318,10 +318,9 @@ async function fetchAndRefresh(forceRefresh = false) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout for large fetches
 
-    let url = `${SERVER_BASE_URL}/api/data?_=${Date.now()}`;
-    if (forceRefresh) {
-      url += '&refresh=true';
-    }
+    let url = forceRefresh 
+      ? `${SERVER_BASE_URL}/api/data?refresh=true&_=${Date.now()}`
+      : `${SERVER_BASE_URL}/api/data`;
 
     const response = await safeFetch(url, { signal: controller.signal });
     clearTimeout(timeoutId);
@@ -347,9 +346,6 @@ async function fetchAndRefresh(forceRefresh = false) {
 
       // Re-render all views with fresh data
       renderAllViews();
-
-      // Repair stale array JSON columns in the background (rate-limited, once per record)
-      scheduleSelfHeal();
     } else {
       throw new Error('Server returned unsuccessful payload');
     }
@@ -455,11 +451,17 @@ function saveToLocalStorage() {
     localStorage.setItem('db_dashboard_stats', JSON.stringify(state.dashboardStats));
     localStorage.setItem('db_uploaded_pdfs', JSON.stringify(state.uploadedPdfs.slice(0, 30)));
 
-    const lightInvoices = state.invoices.slice(0, 100).map(inv => ({
-      ...inv,
-      line_items: []
-    }));
-    const lightPurchases = state.purchases.slice(0, 100);
+    const lightInvoices = state.invoices.slice(0, 100).map(inv => {
+      const copy = { ...inv };
+      delete copy._rawArray;
+      delete copy.line_items;
+      return copy;
+    });
+    const lightPurchases = state.purchases.slice(0, 100).map(pur => {
+      const copy = { ...pur };
+      delete copy._rawArray;
+      return copy;
+    });
 
     localStorage.setItem('db_invoices', JSON.stringify(lightInvoices));
     localStorage.setItem('db_purchases', JSON.stringify(lightPurchases));
