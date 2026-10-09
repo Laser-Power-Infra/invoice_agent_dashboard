@@ -274,11 +274,19 @@ async function ensureTableExists(conn, tableName, columns) {
   try {
     const idxCols = ['party_inv_no', 'our_bill_no', 'present_our_invoice'];
     for (const c of idxCols) {
-      if (columns.includes(c)) {
-        await conn.query(`CREATE INDEX IF NOT EXISTS \`idx_${c}\` ON \`${tableName}\` (\`${c}\`(100))`);
+      if (!columns.includes(c)) continue;
+      const [existingIdx] = await conn.query(
+        `SELECT INDEX_NAME FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+        [tableName, c]
+      );
+      if (existingIdx.length === 0) {
+        await conn.query(`CREATE INDEX \`idx_${c}\` ON \`${tableName}\` (\`${c}\`(100))`);
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn('Could not create search index:', e.message);
+  }
 }
 
 async function insertNewRowsOnly(conn, tableName, rows, columns) {
@@ -401,6 +409,28 @@ async function syncSheetsToMySQL(fullData) {
 let localDbMemoryCache = null;
 let localDbMemoryCacheTime = 0;
 const CACHE_TTL_MYSQL = 60000; // 60 seconds TTL (single-row updates patch in-place)
+let localDbMemoryCacheEtag = null;
+
+// Weak ETag derived from the current payload (cached per payload object identity)
+function getDataEtag(dbData) {
+  if (localDbMemoryCacheEtag && localDbMemoryCacheEtag.for === dbData) {
+    return localDbMemoryCacheEtag.value;
+  }
+  const value = 'W/"' + crypto.createHash('md5').update(JSON.stringify(dbData)).digest('hex') + '"';
+  localDbMemoryCacheEtag = { for: dbData, value };
+  return value;
+}
+
+// Sends the dataset with revalidation headers, returning 304 when unchanged
+function sendDbData(req, res, dbData) {
+  const etag = getDataEtag(dbData);
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('ETag', etag);
+  if (req.headers['if-none-match'] === etag) {
+    return res.status(304).end();
+  }
+  return res.json(dbData);
+}
 
 async function loadDataFromMySQL() {
   const now = Date.now();
@@ -565,6 +595,7 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
       } else {
         list.push(updatedSingleRow);
       }
+      localDbMemoryCacheEtag = null; // Content changed in-place: recompute ETag on next request
     }
 
     return updatedSingleRow;
@@ -614,7 +645,7 @@ app.get('/api/data', async (req, res) => {
         const dbData = await loadDataFromMySQL();
         if (dbData.invoices.length > 0 || dbData.purchases.length > 0) {
           console.log(`Serving data from local MySQL database: ${dbData.invoices.length} invoices, ${dbData.purchases.length} purchases`);
-          return res.json(dbData);
+          return sendDbData(req, res, dbData);
         }
       } catch (dbErr) {
         console.warn('MySQL read failed, falling back to cache/sheets:', dbErr.message);
@@ -637,7 +668,7 @@ app.get('/api/data', async (req, res) => {
     await syncSheetsToMySQL(fullData);
 
     const dbData = await loadDataFromMySQL();
-    res.json(dbData);
+    sendDbData(req, res, dbData);
   } catch (err) {
     activeFetchPromise = null; // Clear the active promise on error
     console.error('Data proxy error:', err.message);
@@ -645,7 +676,7 @@ app.get('/api/data', async (req, res) => {
       const dbData = await loadDataFromMySQL();
       if (dbData.invoices.length > 0 || dbData.purchases.length > 0) {
         console.log('Serving stale data from MySQL due to sheets fetch error');
-        return res.json(dbData);
+        return sendDbData(req, res, dbData);
       }
     } catch (e) {}
     res.status(502).json({ success: false, error: err.message });

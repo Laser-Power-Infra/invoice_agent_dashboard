@@ -45,6 +45,13 @@ function safeFetch(url, options = {}) {
   return fetch(url, opts);
 }
 
+// Single DOM-wide icon refresh (avoids scanning the whole document from every renderer)
+function refreshIcons() {
+  if (typeof lucide !== 'undefined' && lucide.createIcons) {
+    lucide.createIcons();
+  }
+}
+
 // Universal Clipboard Copy Helper (supports HTTPS, HTTP LAN IPs, and non-secure contexts)
 function copyTextToClipboard(text) {
   if (navigator.clipboard && window.isSecureContext) {
@@ -318,9 +325,9 @@ async function fetchAndRefresh(forceRefresh = false) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout for large fetches
 
-    let url = `${SERVER_BASE_URL}/api/data?_=${Date.now()}`;
+    let url = `${SERVER_BASE_URL}/api/data`;
     if (forceRefresh) {
-      url += '&refresh=true';
+      url += '?refresh=true';
     }
 
     const response = await safeFetch(url, { signal: controller.signal });
@@ -692,6 +699,14 @@ function parsePercentValue(value, fallback = 0) {
   return Number.isFinite(parsed) ? (parsed >= 1 ? parsed / 100 : parsed) : fallback;
 }
 
+// Returns the first value that is neither null, undefined nor an empty string
+function pick(...vals) {
+  for (const v of vals) {
+    if (v !== null && v !== undefined && v !== '') return v;
+  }
+  return undefined;
+}
+
 // Convert API arrays/stringified columns to flat structured database objects
 function processRawData(data) {
   state.rawInvoices = data.invoices || [];
@@ -721,6 +736,25 @@ function processRawData(data) {
       console.warn("Failed to parse stringified invoice details: ", e);
     }
 
+    // Flatten newer nested array schema (complex_logic_fields / accounting_entity_fields)
+    // so downstream UI fields are populated exactly like the legacy flat schema.
+    if (parsedArray.complex_logic_fields || parsedArray.accounting_entity_fields) {
+      const nested = { ...(parsedArray.accounting_entity_fields || {}), ...(parsedArray.complex_logic_fields || {}) };
+      Object.keys(nested).forEach(k => {
+        const cur = parsedArray[k];
+        if (cur === undefined || cur === null || cur === '') {
+          parsedArray[k] = nested[k];
+        }
+      });
+      // Prefer nested invoice-level totals when present (per-shipment bill_freight_val is kept from top level)
+      ['net_payable', 'total_invoice_value', 'st_charges', 'taxable_value', 'tds_percent', 'RCM',
+       'cgst_amount', 'sgst_amount', 'igst_amount'].forEach(k => {
+        if (nested[k] !== undefined && nested[k] !== null && nested[k] !== '') {
+          parsedArray[k] = nested[k];
+        }
+      });
+    }
+
     const invoiceNumber = parsedArray.invoice_number || inv.invoice_number || inv.party_inv_no || inv.our_bill_no || '';
     // Debug: log raw server data for BS260000786
     if (invoiceNumber === 'BS260000786') {
@@ -732,14 +766,14 @@ function processRawData(data) {
     const rawInvoiceDateStr = parsedArray.invoice_date || parsedArray.party_inv_date || inv.invoice_date || inv.party_inv_date || '';
     const invoiceDate = normalizeToISODate(rawInvoiceDateStr);
     const partyName = inv.party_name || parsedArray.party_name || parsedArray.transporter_name || '';
-    const billFreightVal = parseNumericValue(inv.bill_freight_val ?? parsedArray.bill_freight_val ?? 0);
-    const netPayable = parseNumericValue(inv.net_payable ?? parsedArray.net_payable ?? inv.final_val_after_deduction ?? parsedArray.final_val_after_deduction ?? 0);
-    const totalInvoiceVal = parseNumericValue(inv.total_invoice_value ?? parsedArray.total_invoice_value ?? inv.net_payable ?? parsedArray.net_payable ?? 0);
-    let rcmValue = parsePercentValue(inv.RCM ?? inv.rcm ?? parsedArray.RCM ?? parsedArray.rcm ?? 0);
-    const stCharges = parseNumericValue(inv.st_charges ?? inv.total_st_charges ?? parsedArray.st_charges ?? parsedArray.total_st_charges ?? 0);
-    let cgstAmount = parseNumericValue(inv.cgst ?? parsedArray.cgst_amount ?? parsedArray.cgst ?? 0);
-    let sgstAmount = parseNumericValue(inv.sgst ?? parsedArray.sgst_amount ?? parsedArray.sgst ?? 0);
-    let igstAmount = parseNumericValue(inv.igst ?? parsedArray.igst_amount ?? parsedArray.igst ?? 0);
+    const billFreightVal = parseNumericValue(pick(parsedArray.bill_freight_val, inv.bill_freight_val, 0));
+    const netPayable = parseNumericValue(pick(parsedArray.net_payable, inv.net_payable, inv.final_val_after_deduction, parsedArray.final_val_after_deduction, 0));
+    const totalInvoiceVal = parseNumericValue(pick(parsedArray.total_invoice_value, inv.total_invoice_value, parsedArray.net_payable, inv.net_payable, 0));
+    let rcmValue = parsePercentValue(pick(parsedArray.RCM, parsedArray.rcm, inv.RCM, inv.rcm, 0));
+    const stCharges = parseNumericValue(pick(parsedArray.st_charges, parsedArray.total_st_charges, inv.st_charges, inv.total_st_charges, 0));
+    let cgstAmount = parseNumericValue(pick(parsedArray.cgst_amount, parsedArray.cgst, inv.cgst, 0));
+    let sgstAmount = parseNumericValue(pick(parsedArray.sgst_amount, parsedArray.sgst, inv.sgst, 0));
+    let igstAmount = parseNumericValue(pick(parsedArray.igst_amount, parsedArray.igst, inv.igst, 0));
 
     const totalGst = cgstAmount + sgstAmount + igstAmount;
     const gstRate = billFreightVal > 0 ? (totalGst / billFreightVal) : 0;
@@ -1098,12 +1132,25 @@ async function syncWithAPI(interactive = true) {
 function renderAllViews() {
   applyRolePermissions();
   updateSettingsStats();
+
+  // Populate filter dropdowns once the dataset is available (avoids resetting active user filters)
+  const partySelect = document.getElementById('inv-filter-party');
+  if (partySelect && partySelect.options.length <= 1) populateSelectorsOptions();
+
   renderDashboard();
-  renderInvoicesLedger();
-  renderPurchasesLedger();
-  renderReconciliation();
-  renderUploadCenter();
-  renderAuditLogsView();
+
+  // Render only the active tab's ledger lazily. This avoids rebuilding every table
+  // (3000+ rows) on each sync; other tabs render when the user switches to them.
+  switch (state.activeTab) {
+    case 'invoices': renderInvoicesLedger(); break;
+    case 'purchases': renderPurchasesLedger(); break;
+    case 'reconciliation': renderReconciliation(); break;
+    case 'uploads': renderUploadCenter(); break;
+    case 'audit-logs': renderAuditLogsView(); break;
+    default: break;
+  }
+
+  refreshIcons();
 }
 
 function formatToDDMMYYYY(dateStr) {
@@ -1260,16 +1307,6 @@ function renderUploadCenter() {
       renderPdfPreview(button.dataset.url, button.dataset.title);
     });
   });
-
-  // Re-run Lucide icons inside listEl to display calendar/help-circle icons
-  if (typeof lucide !== 'undefined') {
-    lucide.createIcons({
-      attrs: {
-        class: 'lucide'
-      },
-      nameAttr: 'data-lucide'
-    });
-  }
 
   // Auto preview first PDF
   const firstPdf = pdfs[0];
@@ -2730,6 +2767,16 @@ function renderInvoicesLedger() {
     return;
   }
 
+  // Pre-index purchases by invoice number for O(1) per-row matching (avoids O(n*m) scans on every render)
+  const purchasesByInvNo = new Map();
+  state.purchases.forEach(p => {
+    const key = String(p.party_inv_no || '').trim();
+    if (!key) return;
+    let list = purchasesByInvNo.get(key);
+    if (!list) { list = []; purchasesByInvNo.set(key, list); }
+    list.push(p);
+  });
+
   // Reset Select All Checkbox
   const selectAllInv = document.getElementById('select-all-invoices-chk');
   if (selectAllInv) selectAllInv.checked = false;
@@ -2819,7 +2866,8 @@ function renderInvoicesLedger() {
     const tr = document.createElement('tr');
     tr.className = 'clickable-row ' + groupClass;    
     // Check if matching purchase record has validation failures or missing FO/Invoice number
-    const matchingPur = [...state.purchases].reverse().find(p => String(p.party_inv_no) === String(inv.invoice_number) && p.bill_freight_val === inv.bill_freight_val);
+    const purList = purchasesByInvNo.get(String(inv.invoice_number || '').trim()) || [];
+    const matchingPur = purList.find(p => p.bill_freight_val === inv.bill_freight_val) || null;
     const isWrong = matchingPur ? hasValidationFailures(matchingPur) : false;
     const isFoOrInvMissing = (!inv.fo_no || inv.fo_no === '-') || (!inv.invoice_number || inv.invoice_number === '-');
     const isRowAlert = !((matchingPur && matchingPur.validated) || inv.validated) && (isWrong || isFoOrInvMissing);
@@ -2923,12 +2971,6 @@ function renderInvoicesLedger() {
     body.appendChild(tr);
   });
 
-  if (typeof lucide !== 'undefined') {
-    lucide.createIcons({
-      attrs: { class: 'lucide' },
-      nameAttr: 'data-lucide'
-    });
-  }
 }
 
 function renderPurchasesLedger() {
@@ -3133,12 +3175,6 @@ function renderPurchasesLedger() {
     body.appendChild(tr);
   });
 
-  if (typeof lucide !== 'undefined') {
-    lucide.createIcons({
-      attrs: { class: 'lucide' },
-      nameAttr: 'data-lucide'
-    });
-  }
 }
 
 function renderReconciliation() {
@@ -3243,8 +3279,6 @@ function renderReconciliation() {
     });
     body.appendChild(tr);
   });
-  
-  lucide.createIcons();
 }
 
 // ==========================================================================
@@ -4273,14 +4307,16 @@ function buildPurchaseDetailsView(purchase, groupRecords) {
     return true;
   }).reverse();
 
-  // Calculate consolidated sums
-  const totalFreight = dedupedGroup.reduce((sum, r) => sum + (r.bill_freight_val || 0), 0);
+  // Retrieve the matching sales invoice (used as a fallback source when the purchase row has no data)
+  const matchingInv = [...state.invoices].reverse().find(i => String(i.invoice_number) === String(purchase.party_inv_no));
+
+  // Calculate consolidated sums (fall back to the matched invoice when the purchase row carries no amounts)
+  const purchaseFreight = dedupedGroup.reduce((sum, r) => sum + (r.bill_freight_val || 0), 0);
+  const totalFreight = purchaseFreight || (matchingInv?.bill_freight_val || 0);
   const totalNet = dedupedGroup.reduce((sum, r) => sum + (r.net_payable || 0), 0);
   const totalTaxable = dedupedGroup.reduce((sum, r) => sum + (r.taxable_value || 0), 0);
   const totalInvoiceVal = dedupedGroup.reduce((sum, r) => sum + (r.total_invoice_value || 0), 0);
 
-  // Retrieve GST values (CGST, SGST, IGST) from matching invoice or purchase record
-  const matchingInv = [...state.invoices].reverse().find(i => String(i.invoice_number) === String(purchase.party_inv_no));
   const stCharges = purchase.st_charges || matchingInv?.st_charges || dedupedGroup.reduce((sum, r) => sum + (r.st_charges || 0), 0);
 
   // Parse foOrderValue
@@ -4362,6 +4398,7 @@ function buildPurchaseDetailsView(purchase, groupRecords) {
   const coalesceField = (key) =>
     purchase[key] ||
     allMatchedPurchases.map(p => p[key]).find(v => v && String(v).trim() !== '' && v !== '-') ||
+    (matchingInv && matchingInv[key]) ||
     '';
 
   const coalescedProject      = coalesceField('project');
@@ -6239,6 +6276,7 @@ function initSearchAndFilters() {
       document.getElementById('recon-search-input').value = q;
       renderReconciliation();
     }
+    refreshIcons();
   });
 
   // INVOICES FILTER ACTIONS
@@ -6249,6 +6287,7 @@ function initSearchAndFilters() {
 
   const triggerInvFilters = () => {
     renderInvoicesLedger();
+    refreshIcons();
   };
 
   invSearch.addEventListener('input', triggerInvFilters);
@@ -6262,6 +6301,7 @@ function initSearchAndFilters() {
     invVehicle.value = '';
     invDivision.value = '';
     renderInvoicesLedger();
+    refreshIcons();
   });
 
   // PURCHASES FILTER ACTIONS
@@ -6272,6 +6312,7 @@ function initSearchAndFilters() {
 
   const triggerPurFilters = () => {
     renderPurchasesLedger();
+    refreshIcons();
   };
 
   purSearch.addEventListener('input', triggerPurFilters);
@@ -6285,6 +6326,7 @@ function initSearchAndFilters() {
     purExpense.value = '';
     purDivision.value = '';
     renderPurchasesLedger();
+    refreshIcons();
   });
 
   // RECONCILIATION SUBTABS FILTER
@@ -6293,11 +6335,13 @@ function initSearchAndFilters() {
       document.querySelectorAll('.recon-filters .btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       renderReconciliation();
+      refreshIcons();
     });
   });
 
   document.getElementById('recon-search-input').addEventListener('input', () => {
     renderReconciliation();
+    refreshIcons();
   });
 
   // Export CSV
