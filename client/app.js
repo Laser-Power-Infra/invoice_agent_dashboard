@@ -2879,6 +2879,68 @@ function parseDateForSort(dateStr) {
   return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
+// ==========================================================================
+// LAZY TABLE RENDERING
+// Renders the first 100 rows instantly, then streams the next 100 each time
+// the user scrolls near the bottom. Keeps the DOM small and the UI snappy
+// even with thousands of records.
+// ==========================================================================
+const LAZY_CHUNK_SIZE = 100;
+const lazyLoaders = {}; // one active loader per table key
+
+function lazyRenderRows(tbody, items, appendRow, key, colSpan) {
+  // A re-render (filter/search/sync) replaces any previous loader for this table
+  if (lazyLoaders[key]) {
+    lazyLoaders[key].disconnect();
+    delete lazyLoaders[key];
+  }
+
+  let index = 0;
+  const renderChunk = () => {
+    const end = Math.min(index + LAZY_CHUNK_SIZE, items.length);
+    for (; index < end; index++) appendRow(items[index]);
+  };
+
+  // First chunk renders immediately
+  renderChunk();
+  if (index >= items.length) return;
+
+  // Sentinel row: rendering continues when it scrolls into view
+  const sentinel = document.createElement('tr');
+  sentinel.className = 'lazy-load-sentinel';
+  const updateSentinelLabel = () => {
+    sentinel.innerHTML = `<td colspan="${colSpan}" style="text-align:center; padding:14px; color:var(--text-muted); font-size:0.8rem;"><span class="lazy-inline-spinner"></span> Scroll to load more&hellip; (${items.length - index} remaining)</td>`;
+  };
+  updateSentinelLabel();
+  tbody.appendChild(sentinel);
+
+  const observer = new IntersectionObserver((entries) => {
+    if (!entries.some(e => e.isIntersecting)) return;
+    sentinel.remove();
+    renderChunk();
+    refreshIcons();
+    if (index < items.length) {
+      updateSentinelLabel();
+      tbody.appendChild(sentinel); // move sentinel back to the bottom
+    } else {
+      observer.disconnect();
+      delete lazyLoaders[key];
+    }
+  }, { rootMargin: '400px 0px' });
+
+  observer.observe(sentinel);
+  lazyLoaders[key] = observer;
+}
+
+// Debounce helper: delays a handler until the user stops typing
+function debounce(fn, waitMs = 200) {
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), waitMs);
+  };
+}
+
 function renderInvoicesLedger() {
   const body = document.getElementById('invoices-table-body');
   body.innerHTML = '';
@@ -2924,7 +2986,7 @@ function renderInvoicesLedger() {
   let lastDate = null;
   const sortedFiltered = sortByUploadDate(filtered);
 
-  sortedFiltered.forEach(inv => {
+  const appendRow = (inv) => {
     const rawDate = inv.upload_date || '';
     const currentDate = rawDate ? formatToDDMMYYYY(rawDate) : 'No Upload Date';
     const groupClass = 'date-group-' + currentDate.replace(/[^a-zA-Z0-9]/g, '_');
@@ -3108,8 +3170,9 @@ function renderInvoicesLedger() {
     }
 
     body.appendChild(tr);
-  });
+  };
 
+  lazyRenderRows(body, sortedFiltered, appendRow, 'invoices', 16);
 }
 
 function renderPurchasesLedger() {
@@ -3146,7 +3209,7 @@ function renderPurchasesLedger() {
   let lastDate = null;
   const sortedFiltered = sortByUploadDate(filtered);
 
-  sortedFiltered.forEach(pur => {
+  const appendRow = (pur) => {
     const rawDate = pur.upload_date || '';
     const currentDate = rawDate ? formatToDDMMYYYY(rawDate) : 'No Upload Date';
     const groupClass = 'date-group-' + currentDate.replace(/[^a-zA-Z0-9]/g, '_');
@@ -3312,8 +3375,9 @@ function renderPurchasesLedger() {
     }
 
     body.appendChild(tr);
-  });
+  };
 
+  lazyRenderRows(body, sortedFiltered, appendRow, 'purchases', 16);
 }
 
 function renderReconciliation() {
@@ -3364,7 +3428,7 @@ function renderReconciliation() {
     return;
   }
 
-  filtered.forEach(r => {
+  const appendRow = (r) => {
     const diffVal = r.invoice_net - r.purchase_net;
     const diffAbs = Math.abs(diffVal);
     let diffClass = 'amount-diff-badge ';
@@ -3417,7 +3481,9 @@ function renderReconciliation() {
       openDetailedRecordModal(r.invoice_number);
     });
     body.appendChild(tr);
-  });
+  };
+
+  lazyRenderRows(body, filtered, appendRow, 'reconciliation', 9);
 }
 
 // ==========================================================================
@@ -6401,7 +6467,7 @@ function addUploadLog(filename, type, fileUrl) {
 function initSearchAndFilters() {
   // Global search top bar
   const globalSearch = document.getElementById('global-search-input');
-  globalSearch.addEventListener('input', () => {
+  globalSearch.addEventListener('input', debounce(() => {
     const q = globalSearch.value.toLowerCase();
     
     // Auto shift search values depending on active menu tab
@@ -6416,7 +6482,7 @@ function initSearchAndFilters() {
       renderReconciliation();
     }
     refreshIcons();
-  });
+  }, 200));
 
   // INVOICES FILTER ACTIONS
   const invSearch = document.getElementById('inv-filter-search');
@@ -6429,7 +6495,7 @@ function initSearchAndFilters() {
     refreshIcons();
   };
 
-  invSearch.addEventListener('input', triggerInvFilters);
+  invSearch.addEventListener('input', debounce(triggerInvFilters, 200));
   invParty.addEventListener('change', triggerInvFilters);
   invVehicle.addEventListener('change', triggerInvFilters);
   invDivision.addEventListener('change', triggerInvFilters);
@@ -6454,7 +6520,7 @@ function initSearchAndFilters() {
     refreshIcons();
   };
 
-  purSearch.addEventListener('input', triggerPurFilters);
+  purSearch.addEventListener('input', debounce(triggerPurFilters, 200));
   purParty.addEventListener('change', triggerPurFilters);
   purExpense.addEventListener('change', triggerPurFilters);
   purDivision.addEventListener('change', triggerPurFilters);
@@ -6478,10 +6544,10 @@ function initSearchAndFilters() {
     });
   });
 
-  document.getElementById('recon-search-input').addEventListener('input', () => {
+  document.getElementById('recon-search-input').addEventListener('input', debounce(() => {
     renderReconciliation();
     refreshIcons();
-  });
+  }, 200));
 
   // Export CSV
   document.getElementById('export-reconciliation-btn').addEventListener('click', exportReconciliationToCSV);

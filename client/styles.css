@@ -1796,6 +1796,19 @@ textarea.form-control {
   to { transform: rotate(360deg); }
 }
 
+/* Inline spinner for lazy "load more" table rows */
+.lazy-inline-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  vertical-align: -2px;
+  border: 2px solid rgba(124, 77, 255, 0.25);
+  border-top-color: var(--accent-purple);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
 /* ==========================================================================
    PREMIUM LOGIN SCREEN STYLES
    ========================================================================== */
