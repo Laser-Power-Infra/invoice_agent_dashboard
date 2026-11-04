@@ -10,6 +10,7 @@ import dotenv from 'dotenv';
 import compression from 'compression';
 import mysql from 'mysql2/promise';
 import crypto from 'crypto';
+import zlib from 'zlib';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '.env') });
@@ -408,28 +409,40 @@ async function syncSheetsToMySQL(fullData) {
 
 let localDbMemoryCache = null;
 let localDbMemoryCacheTime = 0;
-const CACHE_TTL_MYSQL = 60000; // 60 seconds TTL (single-row updates patch in-place)
-let localDbMemoryCacheEtag = null;
+const CACHE_TTL_MYSQL = 600000; // 10 minutes TTL (single-row updates patch the cache in-place,
+                                // and the background Sheets sync invalidates it on real changes)
+let localDbMemoryCacheEtag = null; // { for, etag, json: Buffer, gzip: Buffer }
 
-// Weak ETag derived from the current payload (cached per payload object identity)
-function getDataEtag(dbData) {
+// Serialize + gzip the payload ONCE per data version (object identity) instead of
+// stringifying and compressing multiple MB on every single request
+function getSerializedPayload(dbData) {
   if (localDbMemoryCacheEtag && localDbMemoryCacheEtag.for === dbData) {
-    return localDbMemoryCacheEtag.value;
+    return localDbMemoryCacheEtag;
   }
-  const value = 'W/"' + crypto.createHash('md5').update(JSON.stringify(dbData)).digest('hex') + '"';
-  localDbMemoryCacheEtag = { for: dbData, value };
-  return value;
+  const json = Buffer.from(JSON.stringify(dbData), 'utf8');
+  const etag = 'W/"' + crypto.createHash('md5').update(json).digest('hex') + '"';
+  const gzip = zlib.gzipSync(json, { level: 6 });
+  localDbMemoryCacheEtag = { for: dbData, etag, json, gzip };
+  return localDbMemoryCacheEtag;
 }
 
-// Sends the dataset with revalidation headers, returning 304 when unchanged
+// Sends the dataset with revalidation headers, returning 304 when unchanged.
+// Serves a pre-compressed gzip buffer directly (zero per-request stringify/compress cost).
 function sendDbData(req, res, dbData) {
-  const etag = getDataEtag(dbData);
+  const payload = getSerializedPayload(dbData);
   res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('ETag', etag);
-  if (req.headers['if-none-match'] === etag) {
+  res.setHeader('ETag', payload.etag);
+  if (req.headers['if-none-match'] === payload.etag) {
     return res.status(304).end();
   }
-  return res.json(dbData);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  const acceptsGzip = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  if (acceptsGzip) {
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Vary', 'Accept-Encoding');
+    return res.end(payload.gzip);
+  }
+  return res.end(payload.json);
 }
 
 async function loadDataFromMySQL() {
@@ -595,7 +608,7 @@ async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates
       } else {
         list.push(updatedSingleRow);
       }
-      localDbMemoryCacheEtag = null; // Content changed in-place: recompute ETag on next request
+      localDbMemoryCacheEtag = null; // Content changed in-place: re-serialize on next request
     }
 
     return updatedSingleRow;
@@ -656,7 +669,7 @@ app.get('/api/data', async (req, res) => {
       console.log('Fetch already in progress, queuing request to wait for active fetch...');
       await activeFetchPromise;
       const dbData = await loadDataFromMySQL();
-      return res.json(dbData);
+      return sendDbData(req, res, dbData);
     }
 
     console.log('ForceRefresh requested or MySQL empty. Fetching fresh data from Google Sheets...');

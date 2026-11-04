@@ -10,19 +10,30 @@
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <!-- CSS Stylesheet -->
   <link rel="stylesheet" href="/styles.css">
-  <!-- Chart.js CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <!-- Lucide Icons CDN -->
-  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Preconnect + preload for faster startup -->
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="modulepreload" href="/app.js">
+  <!-- Chart.js CDN (pinned version + defer: does not block first paint) -->
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+  <!-- Lucide Icons CDN (pinned version + defer: no @latest redirect lookup, long-term cacheable) -->
+  <script defer src="https://cdn.jsdelivr.net/npm/lucide@0.453.0/dist/umd/lucide.min.js"></script>
 </head>
 <body class="light-theme">
   <!-- Beautiful Splash/Loading Screen -->
   <div id="page-splash-screen" class="splash-screen">
+    <div class="splash-aurora"></div>
     <div class="splash-content">
-      <img src="https://laserpowerinfra.com/wp-content/uploads/2025/09/lpi-logo.png" alt="Laser Power & Infra Logo" class="splash-logo">
-      <h1 class="splash-title">Laser Power & Infra</h1>
-      <p class="splash-subtitle">Ledger Analytics & Auditing Dashboard</p>
-      <div class="splash-spinner"></div>
+      <div class="splash-logo-stage">
+        <div class="splash-ring splash-ring-1"></div>
+        <div class="splash-ring splash-ring-2"></div>
+        <div class="splash-orbit"><span class="splash-orbit-dot"></span></div>
+        <div class="splash-orbit splash-orbit-reverse"><span class="splash-orbit-dot splash-orbit-dot-2"></span></div>
+        <img src="https://laserpowerinfra.com/wp-content/uploads/2025/09/lpi-logo.png" alt="Laser Power & Infra Logo" class="splash-logo" fetchpriority="high" decoding="async">
+      </div>
+      <h1 class="splash-title">Laser Power &amp; Infra</h1>
+      <p class="splash-subtitle">Ledger Analytics &amp; Auditing Dashboard</p>
+      <div class="splash-progress"><div class="splash-progress-beam"></div></div>
+      <p class="splash-status">Preparing your workspace&hellip;</p>
     </div>
   </div>
 

@@ -288,29 +288,54 @@ function initApp() {
   // Check auth
   const isAuthed = checkAuth();
   if (isAuthed) {
-    // Load metadata only (uploaded PDFs)
-    state.uploadedPdfs = JSON.parse(localStorage.getItem('db_uploaded_pdfs') || '[]');
+    // 1) INSTANT PAINT: render immediately from the local cache — no waiting on network
+    loadLocalDatabase(true);
 
-    // Show loading indicator while fetching from server
-    const reconciliationTbody = document.getElementById('reconciliation-tbody');
-    if (reconciliationTbody) {
-      reconciliationTbody.innerHTML = `<tr><td colspan="12" class="text-center" style="padding:2rem;color:var(--text-muted);">⏳ Loading latest data from server...</td></tr>`;
+    if (state.invoices.length || state.purchases.length) {
+      renderAllViews();
+    } else {
+      // First-ever visit (no cache yet): show a loading hint until the server responds
+      const reconciliationTbody = document.getElementById('reconciliation-tbody');
+      if (reconciliationTbody) {
+        reconciliationTbody.innerHTML = `<tr><td colspan="12" class="text-center" style="padding:2rem;color:var(--text-muted);">⏳ Loading latest data from server...</td></tr>`;
+      }
     }
 
-    // Fetch fresh data from server (always, on every load)
+    // 2) FULL CACHE: hydrate the complete processed dataset from IndexedDB
+    // (replaces the 100-row quick slice above within a few milliseconds)
+    restoreProcessedStateFromIDB();
+
+    // 3) BACKGROUND SYNC: fetch fresh data from the server and re-render when it arrives
     fetchAndRefresh();
   }
 
   // Render Lucide icons
-  lucide.createIcons();
+  refreshIcons();
 
-  // Hide splash screen
+  // Hide splash screen as soon as the first frame is painted
+  hideSplash();
+}
+
+// Hide the splash screen once the UI is ready (keeps a short minimum display
+// time so the animation doesn't flash, then removes the node entirely so its
+// animations stop consuming the compositor)
+let splashHidden = false;
+function hideSplash() {
+  if (splashHidden) return;
+  splashHidden = true;
+
   const splash = document.getElementById('page-splash-screen');
-  if (splash) {
-    setTimeout(() => {
+  if (!splash) return;
+
+  const MIN_SPLASH_MS = 600;
+  const wait = Math.max(0, MIN_SPLASH_MS - performance.now());
+
+  setTimeout(() => {
+    requestAnimationFrame(() => {
       splash.classList.add('fade-out');
-    }, 1200);
-  }
+      setTimeout(() => splash.remove(), 800);
+    });
+  }, wait);
 }
 
 // Fetch fresh data from server, update local cache, then re-render UI
@@ -335,6 +360,18 @@ async function fetchAndRefresh(forceRefresh = false) {
 
     if (!response.ok) throw new Error(`Server returned ${response.status}`);
 
+    // Unchanged data shortcut: if the server's ETag matches what we already
+    // rendered from the full IndexedDB cache, skip the expensive JSON parse,
+    // reprocessing, and re-render of thousands of rows entirely.
+    const etag = response.headers.get('etag') || '';
+    const lastEtag = localStorage.getItem('db_last_etag') || '';
+    if (!forceRefresh && etag && etag === lastEtag && fullCacheRestored) {
+      if (statusIndicator) statusIndicator.className = 'status-indicator online';
+      if (syncTimeLabel) syncTimeLabel.textContent = new Date().toLocaleTimeString();
+      scheduleSelfHeal();
+      return;
+    }
+
     const data = await response.json();
 
     if (data && data.success) {
@@ -342,6 +379,8 @@ async function fetchAndRefresh(forceRefresh = false) {
       if (hasData || !state.invoices.length) {
         // Process fresh server data (source of truth)
         processRawData(data);
+        serverDataApplied = true; // a late IndexedDB cache read must not overwrite this
+        if (etag) localStorage.setItem('db_last_etag', etag);
 
         // Update local cache with fresh data
         saveToLocalStorage();
@@ -418,7 +457,7 @@ function cleanupExpiredLocalPdfs() {
   }
 }
 
-function loadLocalDatabase() {
+function loadLocalDatabase(silent = false) {
   const cachedInvoices = localStorage.getItem('db_invoices');
   const cachedPurchases = localStorage.getItem('db_purchases');
   const cachedDashboardStats = localStorage.getItem('db_dashboard_stats');
@@ -447,8 +486,8 @@ function loadLocalDatabase() {
     }
 
     cleanupExpiredLocalPdfs();
-    showToast('Loaded local database.', 'success');
-  } else {
+    if (!silent) showToast('Loaded local database.', 'success');
+  } else if (!silent) {
     // Process default static data
     processRawData(defaultData);
     cleanupExpiredLocalPdfs();
@@ -473,6 +512,100 @@ function saveToLocalStorage() {
   } catch {
     // Graceful silent handle for browser storage limits
   }
+
+  // Also persist the FULL processed dataset to IndexedDB (async, no localStorage quota limits)
+  saveProcessedStateToIDB();
+}
+
+// ==========================================================================
+// FULL-DATASET CLIENT CACHE (IndexedDB)
+// Stores the complete, already-processed dataset so the next page load renders
+// everything instantly — no network wait and no re-parsing of thousands of rows.
+// ==========================================================================
+const IDB_NAME = 'lpi_dashboard_cache';
+const IDB_STORE = 'kv';
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+        req.result.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGet(key) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const rq = tx.objectStore(IDB_STORE).get(key);
+      rq.onsuccess = () => resolve(rq.result);
+      rq.onerror = () => reject(rq.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function idbSet(key, value) {
+  try {
+    const db = await idbOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // Private windows / blocked storage: cache is a best-effort optimization
+  }
+}
+
+// True once fresh server data has been applied this session; prevents a slow
+// IndexedDB read from overwriting newer server data
+let serverDataApplied = false;
+
+// True once the FULL dataset was restored from IndexedDB (the 100-row localStorage
+// slice alone never counts, so the ETag shortcut can't strand partial data on screen)
+let fullCacheRestored = false;
+
+function saveProcessedStateToIDB() {
+  try {
+    idbSet('processed_state', {
+      invoices: state.invoices,
+      purchases: state.purchases,
+      dashboardStats: state.dashboardStats,
+      savedAt: Date.now()
+    });
+  } catch {
+    // Non-cloneable value or storage failure: skip silently
+  }
+}
+
+async function restoreProcessedStateFromIDB() {
+  const cached = await idbGet('processed_state');
+  if (serverDataApplied || !cached) return;
+  if (!Array.isArray(cached.invoices) || !Array.isArray(cached.purchases)) return;
+  if (!cached.invoices.length && !cached.purchases.length) return;
+
+  state.invoices = cached.invoices;
+  state.purchases = cached.purchases;
+  if (cached.dashboardStats && cached.dashboardStats.invoiceCount) {
+    state.dashboardStats = cached.dashboardStats;
+  } else {
+    state.dashboardStats = {
+      invoiceCount: cached.invoices.length,
+      purchaseCount: cached.purchases.length
+    };
+  }
+  cleanupExpiredLocalPdfs();
+  fullCacheRestored = true;
+  renderAllViews();
 }
 
 // === LOCAL OVERRIDES SYSTEM ===
@@ -1421,6 +1554,12 @@ function renderDashboard() {
 
 // ----------------- CHARTS CREATOR -----------------
 function drawCharts(reconData) {
+  // Chart.js loads via a deferred CDN script; if it isn't available yet, retry shortly
+  if (typeof Chart === 'undefined') {
+    setTimeout(() => { if (typeof Chart !== 'undefined') drawCharts(reconData); }, 500);
+    return;
+  }
+
   // Dynamic styling based on theme
   const isLight = state.theme === 'light';
   const tickColor = isLight ? '#64748b' : '#8892b0';
