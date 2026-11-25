@@ -4951,7 +4951,8 @@ function saveDetailFormOverrides() {
           st_charges: overrideStCharges,
           net_payable: overrideTotalInvoiceVal,
           total_invoice_value: overrideTotalInvoiceVal,
-          RCM: overrideRcm
+          RCM: overrideRcm,
+          stax_code_str: getFormVal('invoice-details-edit-form', 'inv_stax_code_str').trim()
         };
       }
       return inv;
@@ -5009,7 +5010,8 @@ function saveDetailFormOverrides() {
           deparment: overrideDeparment,
           deperment_code: overrideDepermentCode,
           tax_critaria: overrideTaxCritaria,
-          tax_critaria_name: overrideTaxCritariaName
+          tax_critaria_name: overrideTaxCritariaName,
+          stax_code_str: getFormVal('purchase-details-edit-form', 'pur_stax_code_str').trim()
         };
       }
       return pur;
@@ -5077,7 +5079,8 @@ function saveDetailFormOverrides() {
       st_charges: parseFloat(getFormVal('invoice-details-edit-form', 'inv_st_charges') || 0),
       net_payable: parseFloat(getFormVal('invoice-details-edit-form', 'inv_total_invoice_value') || 0),
       total_invoice_value: parseFloat(getFormVal('invoice-details-edit-form', 'inv_total_invoice_value') || 0),
-      RCM: parseFloat(getFormVal('invoice-details-edit-form', 'inv_RCM') || 0)
+      RCM: parseFloat(getFormVal('invoice-details-edit-form', 'inv_RCM') || 0),
+      stax_code_str: getFormVal('invoice-details-edit-form', 'inv_stax_code_str').trim()
     };
     sendSheetUpdate('invoice', invNumber, invoiceFields, invoice, { includeLineItems: true });
     logAuditEntry('Modal Form Save', 'invoice', overrideInvNo, 'Updated invoice details from modal edit form', 'SUCCESS');
@@ -5105,7 +5108,8 @@ function saveDetailFormOverrides() {
       deparment: getFormVal('purchase-details-edit-form', 'pur_deparment'),
       deperment_code: getFormVal('purchase-details-edit-form', 'pur_deperment_code'),
       tax_critaria: getFormVal('purchase-details-edit-form', 'pur_tax_critaria'),
-      tax_critaria_name: getFormVal('purchase-details-edit-form', 'pur_tax_critaria_name')
+      tax_critaria_name: getFormVal('purchase-details-edit-form', 'pur_tax_critaria_name'),
+      stax_code_str: getFormVal('purchase-details-edit-form', 'pur_stax_code_str').trim()
     };
     sendSheetUpdate('purchase', invNumber, purchaseFields, purchase, { includeLineItems: true });
     logAuditEntry('Modal Form Save', 'purchase', overridePurNo, 'Updated purchase details from modal edit form', 'SUCCESS');
