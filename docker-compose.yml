@@ -70,27 +70,11 @@ services:
       - infra
 
   # ---------------------------------------------------
-  # Ngrok Tunnel Service: Public Tunnel for Port 6005
+  # Public access: Cloudflare Tunnel (cloudflared on the "infra" network)
+  # Route the public hostname -> http://invoice_frontend:6004
+  # (nginx in the frontend proxies /api and /upload to the backend).
+  # Ngrok was removed: free-plan request limit (ERR_NGROK_727) broke uploads.
   # ---------------------------------------------------
-  ngrok:
-    image: ngrok/ngrok:latest
-    container_name: invoice_ngrok
-    restart: always
-    env_file:
-      - path: .env
-        required: false
-      - path: ./server/.env
-        required: false
-    command:
-      - "http"
-      - "backend:6005"
-    ports:
-      - "4040:4040"
-    depends_on:
-      - backend
-    networks:
-      - invoice_net
-      - infra
 
 networks:
   invoice_net:
