@@ -253,8 +253,13 @@ let isSyncingToMySQL = false;
 // Build a unique deduplication key for each row to detect new insertions
 function getRowUniqueKey(row, tableName) {
   if (tableName === 'Invoice Details') {
-    // For Purchases / Bills: party_inv_no is unique
-    return String(row.party_inv_no || row.invoice_number || '').trim().toLowerCase();
+    // For Purchases / Bills: one transporter bill (party_inv_no) can cover several of our
+    // invoices / LRs (e.g. HLDB/2627/00145 -> LP26Y-02915 and LP26Y-02916), so the key must
+    // include present_our_invoice - otherwise the 2nd split row is never inserted into MySQL.
+    const inv = String(row.party_inv_no || row.invoice_number || '').trim().toLowerCase();
+    if (!inv) return '';
+    const ours = String(row.present_our_invoice || '').trim().toLowerCase();
+    return `${inv}::${ours}`;
   }
   // For Invoices (Item Details): composite key includes party_inv_no and LR / vehicle to support split shipments
   const inv = String(row.party_inv_no || row.invoice_number || row.our_bill_no || '').trim().toLowerCase();
@@ -307,7 +312,7 @@ async function insertNewRowsOnly(conn, tableName, rows, columns) {
     const [existingTableCols] = await conn.query(`SHOW COLUMNS FROM \`${tableName}\``);
     const existingColNames = existingTableCols.map(c => c.Field.toLowerCase());
     
-    const candidateCols = ['party_inv_no', 'our_bill_no', 'cn_lr_no', 'lorry_vehicle_no', 'invoice_number'];
+    const candidateCols = ['party_inv_no', 'our_bill_no', 'cn_lr_no', 'lorry_vehicle_no', 'invoice_number', 'present_our_invoice'];
     const validSelectCols = candidateCols
       .filter(c => existingColNames.includes(c.toLowerCase()))
       .map(c => `\`${c}\``)
@@ -317,10 +322,13 @@ async function insertNewRowsOnly(conn, tableName, rows, columns) {
       const [existingKeysRows] = await conn.query(`SELECT ${validSelectCols} FROM \`${tableName}\``);
       const existingKeySet = new Set(existingKeysRows.map(r => getRowUniqueKey(r, tableName)));
 
-      // Filter strictly for rows that do NOT exist in MySQL
+      // Filter strictly for rows that do NOT exist in MySQL. Adding each key to the set as we go
+      // also drops repeats inside the sheet itself (same PDF uploaded to Drive several times).
       newRowsToInsert = rows.filter(r => {
         const k = getRowUniqueKey(r, tableName);
-        return k && !existingKeySet.has(k);
+        if (!k || existingKeySet.has(k)) return false;
+        existingKeySet.add(k);
+        return true;
       });
     }
   }
