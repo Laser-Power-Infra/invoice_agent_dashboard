@@ -29,10 +29,14 @@ function saveRepairedKeys(set) {
   try { localStorage.setItem('db_synced_array_keys', JSON.stringify([...set])); } catch (e) {}
 }
 
-const SERVER_BASE_URL = import.meta.env.VITE_SERVER_BASE_URL || (
-  (window.location.port === '6004' || window.location.port === '3000' || !window.location.port || window.location.hostname.includes('ngrok'))
-    ? ''
-    : `http://${window.location.hostname}:6005`
+// When served by the nginx container (port 6004, or via Cloudflare at invoice.gmdalui.co.in with no port),
+// always call the API on the same origin: nginx proxies /api and /upload to the backend.
+// This avoids CORS entirely and ignores any stale VITE_SERVER_BASE_URL baked into the build.
+// invoice-api.gmdalui.co.in is for n8n only (Cloudflare Access service token) - browsers can't use it.
+const SERVED_BY_NGINX = window.location.port === '6004' || !window.location.port;
+const SERVER_BASE_URL = SERVED_BY_NGINX ? '' : (
+  import.meta.env.VITE_SERVER_BASE_URL ||
+  (window.location.port === '3000' ? '' : `http://${window.location.hostname}:6005`)
 );
 console.log('SERVER_BASE_URL resolved to:', SERVER_BASE_URL || '(relative /)');
 
