@@ -791,6 +791,32 @@ function mergeUploadedPdfsFromRecords() {
   state.uploadedPdfs = merged.sort((a, b) => (b.uploadedAt || '').localeCompare(a.uploadedAt || ''));
 }
 
+// Collect all invoice-level FO numbers (e.g. array.fo_order_number = ["PE26Y-00163","PE26Y-00164"])
+function collectFoNumbers(...vals) {
+  const out = [];
+  vals.forEach(v => {
+    (Array.isArray(v) ? v : [v]).forEach(x => {
+      const s = x === null || x === undefined ? '' : String(x).trim();
+      if (s && s !== '-' && !out.includes(s)) out.push(s);
+    });
+  });
+  return out;
+}
+
+// Line items often come back with fo_no = null when the document lists FOs only at
+// invoice level. Fall back to the record's FO list: map by position when the counts
+// match, otherwise show every FO on the invoice. Display-only (works on copies).
+function resolveLineItemFoNo(item, index, record) {
+  if (item && item.fo_no && item.fo_no !== '-') return item.fo_no;
+  const fos = (record && Array.isArray(record.fo_numbers) && record.fo_numbers.length)
+    ? record.fo_numbers
+    : collectFoNumbers(record && record.fo_no);
+  if (fos.length === 0) return item ? item.fo_no : '';
+  const lineCount = record && Array.isArray(record.line_items) ? record.line_items.length : 0;
+  if (fos.length > 1 && fos.length === lineCount) return fos[index];
+  return fos.join(', ');
+}
+
 function extractFirstString(val) {
   if (val === null || val === undefined) return '';
   if (Array.isArray(val)) {
@@ -968,6 +994,7 @@ function processRawData(data) {
       sgst: sgstAmount,
       igst: igstAmount,
       fo_no: extractFirstString(inv.fo_no || parsedArray.fo_no || parsedArray.fo_order_number || ''),
+      fo_numbers: collectFoNumbers(inv.fo_no, parsedArray.fo_no, parsedArray.fo_order_number),
       fo_rate: rawFoRate,
       fo_qty: rawFoQty,
       fo_order_value: rawFoOrderVal,
@@ -1102,6 +1129,7 @@ function processRawData(data) {
       ai_summary: pur["AI SUMMRY"] || pur.ai_summary || parsedArray.ai_summary || '',
       pdf_url: extractPdfUrl(pur) || extractPdfUrl(parsedArray),
       fo_no: extractFirstString(pur.fo_no || parsedArray.fo_no || parsedArray.fo_order_number || pur.fo_order_number || pur.FO_NO || ''),
+      fo_numbers: collectFoNumbers(pur.fo_no, parsedArray.fo_no, parsedArray.fo_order_number, pur.fo_order_number, pur.FO_NO),
       fo_rate: rawPurFoRate,
       fo_qty: rawPurFoQty,
       fo_order_value: rawPurFoOrderVal,
@@ -2336,8 +2364,9 @@ function generateMergedERPRows(invoiceNumber) {
   const groupRecords = inv ? [inv] : (pur ? [pur] : []);
   groupRecords.forEach(r => {
     if (r.line_items && r.line_items.length > 0) {
-      const itemsWithInvoiceNumber = r.line_items.map(item => ({
+      const itemsWithInvoiceNumber = r.line_items.map((item, liIdx) => ({
         ...item,
+        fo_no: resolveLineItemFoNo(item, liIdx, r),
         our_invoice_number: item.our_invoice_number || r.our_bill_no || r.present_our_invoice || (ourInvoiceNo !== '-' ? ourInvoiceNo : '')
       }));
       lineItems = [...lineItems, ...itemsWithInvoiceNumber];
@@ -3902,8 +3931,9 @@ function buildERPRowsView(invoice, purchase) {
   const groupRecords = inv && inv.id ? [inv] : [];
   groupRecords.forEach(r => {
     if (r.line_items && r.line_items.length > 0) {
-      const itemsWithInvoiceNumber = r.line_items.map(item => ({
+      const itemsWithInvoiceNumber = r.line_items.map((item, liIdx) => ({
         ...item,
+        fo_no: resolveLineItemFoNo(item, liIdx, r),
         our_invoice_number: item.our_invoice_number || r.our_bill_no || r.present_our_invoice || (ourInvoiceNo !== '-' ? ourInvoiceNo : '')
       }));
       lineItems = [...lineItems, ...itemsWithInvoiceNumber];
@@ -4347,8 +4377,9 @@ function buildInvoiceDetailsView(invoice, groupRecords) {
   let lineItems = [];
   groupRecords.forEach(r => {
     if (r.line_items && r.line_items.length > 0) {
-      const itemsWithInvoiceNumber = r.line_items.map(item => ({
+      const itemsWithInvoiceNumber = r.line_items.map((item, liIdx) => ({
         ...item,
+        fo_no: resolveLineItemFoNo(item, liIdx, r),
         our_invoice_number: item.our_invoice_number || r.our_bill_no || r.present_our_invoice || ''
       }));
       lineItems = [...lineItems, ...itemsWithInvoiceNumber];
