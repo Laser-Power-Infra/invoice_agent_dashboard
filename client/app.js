@@ -1150,6 +1150,20 @@ function processRawData(data) {
     };
   });
 
+  // Item Details has no upload_date column, so invoices would never fall inside a
+  // date-wise export. Inherit it from the matching purchase (latest upload wins).
+  const purchaseUploadByNo = new Map();
+  state.purchases.forEach(p => {
+    const key = String(p.party_inv_no || '').trim().toLowerCase();
+    if (key && p.upload_date) purchaseUploadByNo.set(key, p.upload_date);
+  });
+  state.invoices.forEach(inv => {
+    if (!inv.upload_date) {
+      const d = purchaseUploadByNo.get(String(inv.invoice_number || '').trim().toLowerCase());
+      if (d) inv.upload_date = d;
+    }
+  });
+
   mergeUploadedPdfsFromRecords();
 
   // Restore manually-validated flags & local overrides from local cache (survives server refresh)
@@ -2649,9 +2663,17 @@ function isRecordRightBill(type, record) {
   // 3. Check for validation failures (skip if there are failures)
   const isWrong = purchase ? hasValidationFailures(purchase) : false;
   
-  // 4. Check for missing critical tracking fields (skip if missing)
-  const isFoOrInvMissing = (invoice && ((!invoice.fo_no || invoice.fo_no === '-') || (!invoice.invoice_number || invoice.invoice_number === '-')))
-                        || (purchase && ((!purchase.fo_no || purchase.fo_no === '-') || (!purchase.party_inv_no || purchase.party_inv_no === '-')));
+  // 4. Check for missing critical tracking fields (skip if missing).
+  // The purchase table (Invoice Details) has no FO column, so the FO can live on
+  // either record or on the line items - only treat it as missing when none has it.
+  const hasVal = v => v !== null && v !== undefined && String(v).trim() !== '' && String(v).trim() !== '-';
+  const hasFo = [invoice, purchase].some(r => r && (
+    hasVal(r.fo_no) ||
+    (Array.isArray(r.fo_numbers) && r.fo_numbers.length > 0) ||
+    (Array.isArray(r.line_items) && r.line_items.some(li => hasVal(li && li.fo_no)))
+  ));
+  const hasInvNo = hasVal(invoice?.invoice_number) || hasVal(purchase?.party_inv_no);
+  const isFoOrInvMissing = !hasFo || !hasInvNo;
 
   if (isWrong || isFoOrInvMissing) {
     return false; // Skip if wrong or missing critical fields
@@ -2659,6 +2681,43 @@ function isRecordRightBill(type, record) {
 
   return true; // Correct / right bill!
 }
+
+// Builds ERP rows for a set of records and downloads them. Exports each bill
+// once (several DB rows can share one invoice number: one row per truck in
+// Item Details, or re-uploads), optionally skips bills that are not "right",
+// and tells the user how many were skipped and why.
+function exportRecordsToCSV(type, records, filename, { onlyRightBills = true } = {}) {
+  const seen = new Set();
+  const mergedRows = [];
+  let exported = 0;
+  const skipped = [];
+  records.forEach(rec => {
+    const invNo = String(rec.invoice_number || rec.party_inv_no || '').trim();
+    if (!invNo || seen.has(invNo.toLowerCase())) return;
+    seen.add(invNo.toLowerCase());
+    if (onlyRightBills && !isRecordRightBill(type, rec)) {
+      skipped.push(invNo);
+      return;
+    }
+    const rows = generateMergedERPRows(invNo);
+    if (rows.length) {
+      mergedRows.push(...rows);
+      exported++;
+    }
+  });
+  if (mergedRows.length === 0) {
+    showToast(skipped.length
+      ? `No exportable bills: ${skipped.length} skipped (failed validation / dev review / missing FO or invoice no).`
+      : 'No records to export.', 'warning');
+    return;
+  }
+  exportToCSV(mergedRows, filename);
+  if (skipped.length) {
+    console.warn(`Export ${filename}: skipped ${skipped.length} bill(s):`, skipped);
+    showToast(`Exported ${exported} bill(s). Skipped ${skipped.length} not-OK bill(s) (failed validation / dev review / missing FO): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? '…' : ''}`, 'warning');
+  }
+}
+window.exportRecordsToCSV = exportRecordsToCSV;
 
 function exportRange(type, startDate, endDate) {
   const startInt = dateToYYYYMMDD(startDate);
@@ -2676,24 +2735,16 @@ function exportRange(type, startDate, endDate) {
   const matching = pool.filter(item => {
     const rawDate = item.upload_date || '';
     if (!rawDate) return false;
-    const itemInt = dateToYYYYMMDD(rawDate);
-    return itemInt >= startInt && itemInt <= endInt && isRecordRightBill(type, item);
+    // Use the same calendar day the table shows (local time), not the UTC day
+    const itemInt = dateToYYYYMMDD(formatToDDMMYYYY(rawDate));
+    return itemInt >= startInt && itemInt <= endInt;
   });
   if (matching.length === 0) {
-    showToast('No correct/right records found within this range.', 'warning');
+    showToast('No records found within this range.', 'warning');
     return;
   }
 
-  const mergedRows = [];
-  matching.forEach(rec => {
-    const invNo = rec.invoice_number || rec.party_inv_no;
-    if (invNo) {
-      const rows = generateMergedERPRows(invNo);
-      mergedRows.push(...rows);
-    }
-  });
-
-  exportToCSV(mergedRows, `${type}s_range_${startDate}_to_${endDate}.csv`);
+  exportRecordsToCSV(type, matching, `${type}s_range_${startDate}_to_${endDate}.csv`);
 }
 
 function initExportAndSelection() {
@@ -2752,16 +2803,7 @@ function initExportAndSelection() {
       const selectedIds = Array.from(checked).map(c => c.getAttribute('data-id'));
       const selectedRows = state.invoices.filter(i => selectedIds.includes(String(i.id)));
       
-      const mergedRows = [];
-      selectedRows.forEach(rec => {
-        const invNo = rec.invoice_number || rec.party_inv_no;
-        if (invNo) {
-          const rows = generateMergedERPRows(invNo);
-          mergedRows.push(...rows);
-        }
-      });
-
-      exportToCSV(mergedRows, `selected_invoices.csv`);
+      exportRecordsToCSV('invoice', selectedRows, `selected_invoices.csv`, { onlyRightBills: false });
     });
   }
 
@@ -2772,16 +2814,7 @@ function initExportAndSelection() {
       const selectedIds = Array.from(checked).map(c => c.getAttribute('data-id'));
       const selectedRows = state.purchases.filter(p => selectedIds.includes(String(p.id)));
       
-      const mergedRows = [];
-      selectedRows.forEach(rec => {
-        const invNo = rec.invoice_number || rec.party_inv_no;
-        if (invNo) {
-          const rows = generateMergedERPRows(invNo);
-          mergedRows.push(...rows);
-        }
-      });
-
-      exportToCSV(mergedRows, `selected_purchases.csv`);
+      exportRecordsToCSV('purchase', selectedRows, `selected_purchases.csv`, { onlyRightBills: false });
     });
   }
 }
@@ -3079,18 +3112,9 @@ function renderInvoicesLedger() {
           const dateRows = filtered.filter(item => {
             const rawDate = item.upload_date || '';
             return (rawDate ? formatToDDMMYYYY(rawDate) : 'No Upload Date') === targetDate;
-          }).filter(item => isRecordRightBill('invoice', item));
-          
-          const mergedRows = [];
-          dateRows.forEach(rec => {
-            const invNo = rec.invoice_number || rec.party_inv_no;
-            if (invNo) {
-              const rows = generateMergedERPRows(invNo);
-              mergedRows.push(...rows);
-            }
           });
-          
-          exportToCSV(mergedRows, `invoices_${targetDate}.csv`);
+
+          exportRecordsToCSV('invoice', dateRows, `invoices_${targetDate}.csv`);
         });
       }
       
@@ -3302,18 +3326,9 @@ function renderPurchasesLedger() {
           const dateRows = filtered.filter(item => {
             const rawDate = item.upload_date || '';
             return (rawDate ? formatToDDMMYYYY(rawDate) : 'No Upload Date') === targetDate;
-          }).filter(item => isRecordRightBill('purchase', item));
-          
-          const mergedRows = [];
-          dateRows.forEach(rec => {
-            const invNo = rec.invoice_number || rec.party_inv_no;
-            if (invNo) {
-              const rows = generateMergedERPRows(invNo);
-              mergedRows.push(...rows);
-            }
           });
-          
-          exportToCSV(mergedRows, `purchases_${targetDate}.csv`);
+
+          exportRecordsToCSV('purchase', dateRows, `purchases_${targetDate}.csv`);
         });
       }
       
